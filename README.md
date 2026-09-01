@@ -2,7 +2,7 @@
 
 Reorder Omarchy workspaces by swapping their windows. Hyprland cannot renumber workspaces, and the built-in `omarchy.workspaces` widget stays numeric — this plugin exchanges the mapped, non-pinned windows (and your labels) between two ids instead. The panel lists the same active range as the bar (always 1–5, plus any higher live workspace up to 10), including empty slots in the middle.
 
-Click the bar icon to rename workspaces, move a row up or down, or drag the handle. Super+Shift+, and Super+Shift+. swap the current workspace with its neighbor.
+Click the bar icon to rename workspaces, move a row up or down, or drag the handle. Default Super+Shift+, and Super+Shift+. swap the current workspace with its neighbor; click a shortcut in the panel and press a combo to change it.
 
 ## Install
 
@@ -22,23 +22,16 @@ On first enable, the plugin writes a managed bind block into `~/.config/hypr/bin
 ~/.config/omarchy/plugins/io.github.danihenrique.workspace-shift/scripts/apply-binds
 ```
 
-## Super+< vs Super+Shift+comma
+## Super+Shift+comma
 
-On US QWERTY, the physical `<` key is Shift+comma. Omarchy/Hyprland will *register* `SUPER + less`, but that bind does not fire. `SUPER + SHIFT + comma` does.
-
-Workspace Shift therefore binds both:
-
-- Left: `SUPER + SHIFT + comma` (and `SUPER + less` as an extra)
-- Right: `SUPER + SHIFT + period` (and `SUPER + greater` as an extra)
-
-`SUPER + SHIFT + comma` is unbound first — it previously dismissed all notifications.
+On US QWERTY, `<` is Shift+comma. The panel records the combo you press (e.g. `SUPER + SHIFT + comma`) rather than free-typed bind strings. Apply still also registers extra `SUPER + less` / `SUPER + greater` binds, because Hyprland will register `SUPER + less` but that key does not fire.
 
 ## Usage
 
 - **Bar icon** — open the Workspaces panel
 - **Labels** — edit a row and it saves immediately to `~/.config/omarchy/workspace-shift.json`
 - **Up / down / drag** — swap that workspace's windows *and* label with the neighbor. Workspace numbers stay numeric; empty slots in the active range stay visible.
-- **Apply** — write the left/right shortcuts into the managed Hypr bind block and `hyprctl reload`
+- **Shortcuts** — click Left or Right, then press a combination that includes Super, Ctrl, or Alt. The control records Omarchy `o.bind` syntax and applies immediately. Apply re-applies the current binds.
 - **CLI** — `scripts/workspace-shift left|right` or `scripts/workspace-shift swap SRC DEST`
 
 This plugin does **not** replace `omarchy.workspaces`.

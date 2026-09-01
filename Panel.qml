@@ -31,6 +31,8 @@ Panel {
   property var swapQueue: []
   property bool writingConfig: false
   property bool labelFocused: false
+  property bool recordingLeft: false
+  property bool recordingRight: false
   property string status: ""
   property bool statusIsError: false
 
@@ -39,7 +41,7 @@ Panel {
   property real dragDelta: 0
   readonly property real rowHeight: Math.max(Style.space(34), Style.font.body + Style.space(16))
   readonly property bool busy: swapProc.running || applyProc.running || refreshProc.running || root.swapQueue.length > 0
-  readonly property bool fieldsFocused: root.labelFocused || leftField.activeFocus || rightField.activeFocus
+  readonly property bool fieldsFocused: root.labelFocused || root.recordingLeft || root.recordingRight
 
   function switchPanel(direction) {
     if (root.bar && typeof root.bar.switchPanelFrom === "function")
@@ -50,10 +52,11 @@ Panel {
   onOpenedChanged: {
     if (!root.opened) {
       root.dragFrom = -1
+      root.stopRecording()
       return
     }
     root.status = ""
-    root.syncShortcutFields()
+    root.stopRecording()
     root.refresh()
   }
 
@@ -62,13 +65,57 @@ Panel {
     root.labels = cfg.labels
     root.shortcutLeft = cfg.shortcutLeft
     root.shortcutRight = cfg.shortcutRight
-    if (root.opened) root.syncShortcutFields()
+    if (root.opened) root.stopRecording()
     root.applySnapshot()
   }
 
-  function syncShortcutFields() {
-    if (leftField) leftField.text = root.shortcutLeft
-    if (rightField) rightField.text = root.shortcutRight
+  function stopRecording() {
+    root.recordingLeft = false
+    root.recordingRight = false
+  }
+
+  function beginRecording(side) {
+    root.status = ""
+    root.statusIsError = false
+    if (side === "right") {
+      root.recordingLeft = false
+      root.recordingRight = true
+    } else {
+      root.recordingRight = false
+      root.recordingLeft = true
+    }
+  }
+
+  function handleCaptureKey(event, side) {
+    if (Model.isModifierKey(event.key)) {
+      event.accepted = true
+      return
+    }
+
+    var primary = Model.superModifierMask() | Qt.ControlModifier | Qt.AltModifier
+    if (event.key === Qt.Key_Escape && !(event.modifiers & primary)) {
+      root.stopRecording()
+      keyCatcher.forceActiveFocus()
+      event.accepted = true
+      return
+    }
+
+    var bind = Model.bindStringFromKeyEvent(event.key, event.modifiers, event.text)
+    if (bind) {
+      if (side === "right") root.shortcutRight = bind
+      else root.shortcutLeft = bind
+      root.stopRecording()
+      root.applyBinds()
+      keyCatcher.forceActiveFocus()
+      event.accepted = true
+      return
+    }
+
+    if (!Model.hasPrimaryModifier(event.modifiers)) {
+      root.status = "Add Super/Ctrl/Alt"
+      root.statusIsError = true
+    }
+    event.accepted = true
   }
 
   function saveConfig() {
@@ -196,8 +243,6 @@ Panel {
   }
 
   function applyBinds() {
-    root.shortcutLeft = leftField.text.trim() || root.shortcutLeft
-    root.shortcutRight = rightField.text.trim() || root.shortcutRight
     root.saveConfig()
     root.status = "Applying shortcuts\u2026"
     root.statusIsError = false
@@ -267,6 +312,73 @@ Panel {
     running: root.opened && !root.busy && !root.fieldsFocused
     repeat: true
     onTriggered: root.refresh()
+  }
+
+
+  component ShortcutCapture: Row {
+    id: capture
+    required property string label
+    required property string side
+    required property string bindValue
+    required property bool recording
+    signal startRecording()
+
+    width: parent.width
+    spacing: Style.space(8)
+
+    Text {
+      width: Style.space(40)
+      anchors.verticalCenter: parent.verticalCenter
+      textFormat: Text.PlainText
+      text: capture.label
+      color: root.secondaryForeground
+      font.family: root.contentFontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Item {
+      id: captureFocus
+      width: parent.width - Style.space(48)
+      height: bindBtn.implicitHeight
+      anchors.verticalCenter: parent.verticalCenter
+      activeFocusOnTab: false
+      focus: capture.recording
+
+      Keys.enabled: capture.recording
+      Keys.priority: Keys.BeforeItem
+      Keys.onPressed: function(event) {
+        root.handleCaptureKey(event, capture.side)
+      }
+
+      onActiveFocusChanged: {
+        if (capture.recording && !activeFocus)
+          root.stopRecording()
+      }
+
+      Button {
+        id: bindBtn
+        anchors.fill: parent
+        text: capture.recording ? "Press shortcut\u2026" : capture.bindValue
+        bordered: true
+        leftAlign: true
+        active: capture.recording
+        focusable: false
+        foreground: root.contentForeground
+        fontFamily: root.contentFontFamily
+        fontSize: Style.font.bodySmall
+        onClicked: {
+          if (!capture.recording)
+            capture.startRecording()
+        }
+      }
+    }
+
+    onRecordingChanged: {
+      if (recording)
+        Qt.callLater(function() { captureFocus.forceActiveFocus() })
+      else if (captureFocus.activeFocus)
+        keyCatcher.forceActiveFocus()
+    }
   }
 
   KeyboardPanel {
@@ -478,64 +590,20 @@ Panel {
           fontFamily: root.contentFontFamily
         }
 
-        Row {
-          width: parent.width
-          spacing: Style.space(8)
-
-          Text {
-            width: Style.space(40)
-            anchors.verticalCenter: parent.verticalCenter
-            textFormat: Text.PlainText
-            text: "Left"
-            color: root.secondaryForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          TextField {
-            id: leftField
-            width: parent.width - Style.space(48)
-            placeholderText: "SUPER + SHIFT + comma"
-            foreground: root.contentForeground
-            placeholderTextColor: root.secondaryForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.bodySmall
-            verticalPadding: Style.space(4)
-            Keys.onEscapePressed: function(event) {
-              keyCatcher.forceActiveFocus()
-              event.accepted = true
-            }
-          }
+        ShortcutCapture {
+          label: "Left"
+          side: "left"
+          bindValue: root.shortcutLeft
+          recording: root.recordingLeft
+          onStartRecording: root.beginRecording("left")
         }
 
-        Row {
-          width: parent.width
-          spacing: Style.space(8)
-
-          Text {
-            width: Style.space(40)
-            anchors.verticalCenter: parent.verticalCenter
-            textFormat: Text.PlainText
-            text: "Right"
-            color: root.secondaryForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.caption
-          }
-
-          TextField {
-            id: rightField
-            width: parent.width - Style.space(48)
-            placeholderText: "SUPER + SHIFT + period"
-            foreground: root.contentForeground
-            placeholderTextColor: root.secondaryForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.bodySmall
-            verticalPadding: Style.space(4)
-            Keys.onEscapePressed: function(event) {
-              keyCatcher.forceActiveFocus()
-              event.accepted = true
-            }
-          }
+        ShortcutCapture {
+          label: "Right"
+          side: "right"
+          bindValue: root.shortcutRight
+          recording: root.recordingRight
+          onStartRecording: root.beginRecording("right")
         }
 
         Button {
@@ -551,7 +619,7 @@ Panel {
           width: parent.width
           textFormat: Text.PlainText
           wrapMode: Text.WordWrap
-          text: "On US QWERTY, Super+< is Super+Shift+comma, not SUPER+less. SUPER+less was registered but did not fire; SUPER+SHIFT+comma did. Both are bound."
+          text: "Click a shortcut, then press the combination to record it."
           color: root.secondaryForeground
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.caption
