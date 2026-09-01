@@ -22,7 +22,10 @@ Panel {
   readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/io.github.danihenrique.workspace-shift"
   readonly property string shiftScript: pluginDir + "/scripts/workspace-shift"
   readonly property string applyScript: pluginDir + "/scripts/apply-binds"
+  readonly property string timeoutWrap: pluginDir + "/scripts/with-timeout"
   readonly property string configPath: Quickshell.env("HOME") + "/.config/omarchy/workspace-shift.json"
+  readonly property int maxProcessOutput: 2097152
+  readonly property int processDeadlineMs: 16000
 
   property var labels: ({})
   property string shortcutLeft: "SUPER + SHIFT + comma"
@@ -40,7 +43,7 @@ Panel {
   property real dragOriginY: 0
   property real dragDelta: 0
   readonly property real rowHeight: Math.max(Style.space(34), Style.font.body + Style.space(16))
-  readonly property bool busy: swapProc.running || applyProc.running || refreshProc.running || root.swapQueue.length > 0
+  readonly property bool busy: swapProc.running || applyProc.running || refreshProc.running || labelSaveProc.running || root.swapQueue.length > 0
   readonly property bool fieldsFocused: root.labelFocused || root.recordingLeft || root.recordingRight
 
   function switchPanel(direction) {
@@ -118,15 +121,19 @@ Panel {
     event.accepted = true
   }
 
-  function saveConfig() {
+  function persistLabel(wsId, text) {
+    if (labelSaveProc.running) {
+      root.pendingLabel = { wsId: wsId, text: text }
+      return
+    }
+    root.pendingLabel = null
     root.writingConfig = true
-    configFile.setText(Model.serializeConfig({
-      labels: root.labels,
-      shortcutLeft: root.shortcutLeft,
-      shortcutRight: root.shortcutRight
-    }))
-    Qt.callLater(function() { root.writingConfig = false })
+    labelSaveProc.command = [root.timeoutWrap, "15", root.applyScript, "--set-label", String(wsId), String(text || ""), "--no-reload"]
+    labelSaveWatchdog.restart()
+    labelSaveProc.running = true
   }
+
+  property var pendingLabel: null
 
   property string workspacesText: "[]"
 
@@ -170,7 +177,7 @@ Panel {
     var idx = root.indexOfWs(wsId)
     if (idx >= 0)
       rows.setProperty(idx, "label", Model.labelOf(root.labels, wsId))
-    root.saveConfig()
+    root.persistLabel(wsId, Model.labelOf(root.labels, wsId))
   }
 
   function swapNeighbor(a, b) {
@@ -238,16 +245,22 @@ Panel {
     root.swapQueue = rest
     root.status = "Swapping " + job.src + " \u2194 " + job.dest
     root.statusIsError = false
-    swapProc.command = [root.shiftScript, "swap", String(job.src), String(job.dest)]
+    swapProc.command = [root.timeoutWrap, "15", root.shiftScript, "swap", String(job.src), String(job.dest)]
+    swapWatchdog.restart()
     swapProc.running = true
   }
 
   function applyBinds() {
-    root.saveConfig()
     root.status = "Applying shortcuts\u2026"
     root.statusIsError = false
-    applyProc.command = [root.applyScript, "--left", root.shortcutLeft, "--right", root.shortcutRight]
+    applyProc.command = [root.timeoutWrap, "15", root.applyScript, "--left", root.shortcutLeft, "--right", root.shortcutRight]
+    applyWatchdog.restart()
     applyProc.running = true
+  }
+
+  function failTimedOut(kind) {
+    root.status = kind + " timed out"
+    root.statusIsError = true
   }
 
   ListModel { id: rows }
@@ -256,7 +269,7 @@ Panel {
     id: configFile
     path: root.configPath
     watchChanges: true
-    atomicWrites: true
+    atomicWrites: false  // writes go through apply-binds / safe_io
     printErrors: false
     onLoaded: {
       if (root.writingConfig) return
@@ -272,22 +285,38 @@ Panel {
 
   Process {
     id: refreshProc
-    command: [root.pluginDir + "/scripts/list-state"]
+    command: [root.timeoutWrap, "15", root.pluginDir + "/scripts/list-state"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyListState(text)
+      onStreamFinished: {
+        if (!text || text.length > root.maxProcessOutput) return
+        root.applyListState(text)
+      }
+    }
+    onRunningChanged: {
+      if (running) refreshWatchdog.restart()
+      else refreshWatchdog.stop()
+    }
+    onExited: function(exitCode) {
+      refreshWatchdog.stop()
+      // Keep the last good list; periodic refresh should stay quiet on failure.
     }
   }
 
   Process {
     id: swapProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { /* one-line JSON status from workspace-shift */ }
+    }
     onExited: function(exitCode) {
+      swapWatchdog.stop()
       if (exitCode !== 0) {
-        root.status = "Swap failed"
+        root.status = (exitCode === 124 || exitCode === 137) ? "Swap timed out" : "Swap failed"
         root.statusIsError = true
         root.swapQueue = []
         configFile.reload()
-        refreshProc.running = true
+        if (!refreshProc.running) refreshProc.running = true
         return
       }
       root.status = ""
@@ -299,13 +328,79 @@ Panel {
   Process {
     id: applyProc
     onExited: function(exitCode) {
+      applyWatchdog.stop()
       if (exitCode !== 0) {
-        root.status = "Could not apply shortcuts"
+        root.status = (exitCode === 124 || exitCode === 137) ? "Apply timed out" : "Could not apply shortcuts"
         root.statusIsError = true
         return
       }
       root.status = "Shortcuts applied"
       root.statusIsError = false
+    }
+  }
+
+  Process {
+    id: labelSaveProc
+    onExited: function(exitCode) {
+      labelSaveWatchdog.stop()
+      root.writingConfig = false
+      if (exitCode !== 0) {
+        root.status = (exitCode === 124 || exitCode === 137) ? "Save timed out" : "Could not save label"
+        root.statusIsError = true
+      }
+      if (root.pendingLabel) {
+        var job = root.pendingLabel
+        root.pendingLabel = null
+        root.persistLabel(job.wsId, job.text)
+      }
+    }
+  }
+
+  Timer {
+    id: swapWatchdog
+    interval: root.processDeadlineMs
+    repeat: false
+    onTriggered: {
+      if (swapProc.running) {
+        swapProc.running = false
+        root.failTimedOut("Swap")
+        root.swapQueue = []
+        configFile.reload()
+        if (!refreshProc.running) refreshProc.running = true
+      }
+    }
+  }
+
+  Timer {
+    id: applyWatchdog
+    interval: root.processDeadlineMs
+    repeat: false
+    onTriggered: {
+      if (applyProc.running) {
+        applyProc.running = false
+        root.failTimedOut("Apply")
+      }
+    }
+  }
+
+  Timer {
+    id: refreshWatchdog
+    interval: root.processDeadlineMs
+    repeat: false
+    onTriggered: {
+      if (refreshProc.running) refreshProc.running = false
+    }
+  }
+
+  Timer {
+    id: labelSaveWatchdog
+    interval: root.processDeadlineMs
+    repeat: false
+    onTriggered: {
+      if (labelSaveProc.running) {
+        labelSaveProc.running = false
+        root.failTimedOut("Save")
+      }
     }
   }
 

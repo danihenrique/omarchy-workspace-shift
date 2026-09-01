@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Bound a command so QML Process / callers cannot hang forever.
+# Prefers a systemd --user transient service (RuntimeMaxSec reaps the
+# cgroup even if the parent is SIGKILLed). Falls back to GNU timeout,
+# which signals the process group.
+set -euo pipefail
+
+usage() {
+  echo "usage: $(basename "$0") SECONDS command [args...]" >&2
+  exit 2
+}
+
+(( $# >= 2 )) || usage
+secs="$1"
+shift
+[[ "$secs" =~ ^[1-9][0-9]{0,3}$ ]] || usage
+
+if command -v systemd-run >/dev/null 2>&1; then
+  props=(
+    --user --pipe --wait --quiet --collect
+    -p "RuntimeMaxSec=${secs}"
+    -p "KillSignal=SIGKILL"
+    -p "LogLevelMax=notice"
+    -p "MemoryMax=128M"
+  )
+  if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" && "${HYPRLAND_INSTANCE_SIGNATURE}" =~ ^[0-9A-Za-z_]+$ ]]; then
+    props+=(-p "Environment=HYPRLAND_INSTANCE_SIGNATURE=${HYPRLAND_INSTANCE_SIGNATURE}")
+  fi
+  if [[ -n "${PATH:-}" ]]; then
+    props+=(-p "Environment=PATH=${PATH}")
+  fi
+  if [[ -n "${HOME:-}" && "${HOME}" == /* ]]; then
+    props+=(-p "Environment=HOME=${HOME}")
+  fi
+  if [[ -n "${XDG_CONFIG_HOME:-}" && "${XDG_CONFIG_HOME}" == /* ]]; then
+    props+=(-p "Environment=XDG_CONFIG_HOME=${XDG_CONFIG_HOME}")
+  fi
+  if [[ -n "${XDG_STATE_HOME:-}" && "${XDG_STATE_HOME}" == /* ]]; then
+    props+=(-p "Environment=XDG_STATE_HOME=${XDG_STATE_HOME}")
+  fi
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && "${XDG_RUNTIME_DIR}" == /* ]]; then
+    props+=(-p "Environment=XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}")
+  fi
+  exec systemd-run "${props[@]}" -- "$@"
+fi
+
+exec timeout --kill-after=2s "${secs}s" "$@"

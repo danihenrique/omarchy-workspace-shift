@@ -3,8 +3,10 @@
 # Hyprland cannot reorder workspace numbers, so "shift" means exchanging
 # window sets via an empty temp workspace.
 #
-# Omarchy: focus each window before moving (address-only moves are flaky).
-set -u
+# Moves are locked, snapshotted, and rolled back on failure. Labels swap
+# only after every window has landed. Omarchy: focus each window before
+# moving (address-only moves are flaky).
+set -uo pipefail
 
 usage() {
   echo "usage: $(basename "$0") left|right" >&2
@@ -13,54 +15,118 @@ usage() {
 }
 
 NOTIFY_GLYPH=$'\U000f08ac'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SAFE_IO="${SCRIPT_DIR}/safe_io.py"
+HYPR_MAX_BYTES=2097152
+HYPR_TIMEOUT=5
+MAX_CLIENTS=256
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-shift"
+LOCK="${STATE_DIR}/swap.lock"
 
 notify() {
   local msg="$1"
   local timeout="${2:-1500}"
-  omarchy-notification-send -g "$NOTIFY_GLYPH" "$msg" -t "$timeout" || true
+  timeout --kill-after=2s 5s omarchy-notification-send -g "$NOTIFY_GLYPH" "$msg" -t "$timeout" >/dev/null 2>&1 || true
 }
 
-CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/workspace-shift.json"
+hypr_json() {
+  timeout --kill-after=2s "${HYPR_TIMEOUT}s" hyprctl "$@" | head -c "${HYPR_MAX_BYTES}"
+}
 
-# Labels travel with the window set: after swapping workspaces A and B,
-# label(A) and label(B) exchange too.
-swap_labels() {
-  local a="$1" b="$2"
-  local tmp dir
-  [[ -f "$CONFIG" ]] || return 0
-  dir="$(dirname "$CONFIG")"
-  mkdir -p "$dir"
-  tmp="$(mktemp "$dir/workspace-shift.XXXXXX")"
-  if jq --arg a "$a" --arg b "$b" '
-      .labels = (.labels // {})
-      | . as $root
-      | ($root.labels[$a] // null) as $la
-      | ($root.labels[$b] // null) as $lb
-      | .labels[$a] = $lb
-      | .labels[$b] = $la
-      | if .labels[$a] == null then del(.labels[$a]) else . end
-      | if .labels[$b] == null then del(.labels[$b]) else . end
-    ' "$CONFIG" >"$tmp"; then
-    mv "$tmp" "$CONFIG"
+hypr_dispatch() {
+  timeout --kill-after=2s "${HYPR_TIMEOUT}s" hyprctl dispatch "$@"
+}
+
+emit_status() {
+  # emit_status OK ERROR SRC DEST ROLLED
+  local ok="$1" error="$2" src="$3" dest="$4" rolled="${5:-}"
+  if [[ -n "$rolled" ]]; then
+    jq -nc --argjson ok "$ok" --arg error "$error" --argjson src "$src" --argjson dest "$dest" --argjson rolled_back "$rolled" \
+      '{ok:$ok,src:$src,dest:$dest} + (if $error != "" then {error:$error} else {} end) + {rolled_back:$rolled_back}'
   else
-    rm -f "$tmp"
+    jq -nc --argjson ok "$ok" --arg error "$error" --argjson src "$src" --argjson dest "$dest" \
+      '{ok:$ok,src:$src,dest:$dest} + (if $error != "" then {error:$error} else {} end)'
   fi
 }
 
-clients_on() {
-  hyprctl clients -j | jq -r --argjson ws "$1" '
-    .[]
-    | select(.workspace.id == $ws and .mapped == true and ((.pinned // false) | not))
-    | .address'
+valid_ws() {
+  [[ "$1" =~ ^[1-9]$|^10$ ]]
+}
+
+valid_addr() {
+  [[ "$1" =~ ^0x[0-9a-fA-F]+$ ]]
+}
+
+snapshot_clients() {
+  local src="$1" dest="$2"
+  local raw
+  raw="$(hypr_json clients -j)" || return 1
+  if (( ${#raw} < 2 || ${#raw} >= HYPR_MAX_BYTES )); then
+    return 1
+  fi
+  timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -c --argjson src "$src" --argjson dest "$dest" --argjson max "$MAX_CLIENTS" '
+    [
+      .[:$max][]?
+      | select(.mapped == true and ((.pinned // false) | not))
+      | select(.workspace.id == $src or .workspace.id == $dest)
+      | select((.address | type) == "string" and (.address | test("^0x[0-9a-fA-F]+$")))
+      | {address, workspace: .workspace.id}
+    ]
+  ' <<<"$raw"
+}
+
+clients_from_snap() {
+  local snap="$1" ws="$2"
+  timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r --argjson ws "$ws" '
+    .[] | select(.workspace == $ws) | .address
+  ' <<<"$snap"
+}
+
+focus_workspace() {
+  local ws="$1"
+  hypr_dispatch "hl.dsp.focus({ workspace = \"${ws}\" })" >/dev/null || true
+}
+
+move_addr() {
+  local addr="$1"
+  local dest="$2"
+  local out now raw
+  valid_addr "$addr" || return 1
+  valid_ws "$dest" || return 1
+  hypr_dispatch "hl.dsp.focus({ window = \"address:${addr}\" })" >/dev/null || return 1
+  sleep 0.03
+  out="$(hypr_dispatch "hl.dsp.window.move({ workspace = \"${dest}\", follow = false })" 2>&1)" || return 1
+  [[ "$out" == "ok" ]] || return 1
+  sleep 0.03
+  raw="$(hypr_json clients -j)" || return 1
+  now="$(timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r --arg a "$addr" '
+    .[] | select(.address == $a) | .workspace.id | tostring
+  ' <<<"$raw")" || return 1
+  [[ "$now" == "$dest" ]]
+}
+
+rollback_snapshot() {
+  local snap="$1"
+  local addr ws fail=0
+  while IFS=$'\t' read -r addr ws; do
+    [[ -n "${addr:-}" && -n "${ws:-}" ]] || continue
+    valid_addr "$addr" || continue
+    valid_ws "$ws" || continue
+    move_addr "$addr" "$ws" || fail=1
+  done < <(timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r '.[] | [.address, (.workspace|tostring)] | @tsv' <<<"$snap")
+  return "$fail"
 }
 
 pick_temp() {
-  local src="$1" dest="$2" candidate count
+  local src="$1" dest="$2" candidate count raw
+  raw="$(hypr_json clients -j)" || return 1
   for candidate in 8 9 10 7 6 3; do
     if (( candidate == src || candidate == dest )); then
       continue
     fi
-    count="$(hyprctl clients -j | jq --argjson ws "$candidate" '[.[] | select(.workspace.id == $ws)] | length')"
+    count="$(timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq --argjson ws "$candidate" '
+      [.[] | select(.workspace.id == $ws)] | length
+    ' <<<"$raw")" || continue
     if [[ "$count" == "0" ]]; then
       echo "$candidate"
       return 0
@@ -69,17 +135,14 @@ pick_temp() {
   return 1
 }
 
-move_addr() {
-  local addr="$1"
-  local dest="$2"
-  local out now
-  hyprctl dispatch "hl.dsp.focus({ window = \"address:${addr}\" })" >/dev/null || return 1
-  sleep 0.03
-  out="$(hyprctl dispatch "hl.dsp.window.move({ workspace = \"${dest}\", follow = false })" 2>&1)"
-  [[ "$out" == "ok" ]] || return 1
-  sleep 0.03
-  now="$(hyprctl clients -j | jq -r --arg a "$addr" '.[] | select(.address == $a) | .workspace.id')"
-  [[ "$now" == "$dest" ]]
+acquire_lock() {
+  mkdir -p -m 700 "$STATE_DIR"
+  exec 9>"$LOCK"
+  if ! flock -w 15 9; then
+    emit_status false "lock-timeout" "${1:-0}" "${2:-0}"
+    return 1
+  fi
+  return 0
 }
 
 swap_workspaces() {
@@ -87,75 +150,134 @@ swap_workspaces() {
   local dest="$2"
   local focus_after="${3:-$dest}"
 
-  if [[ ! "$src" =~ ^[0-9]+$ || ! "$dest" =~ ^[0-9]+$ ]]; then
-    echo "workspace ids must be numeric" >&2
-    return 2
-  fi
-  if (( src < 1 || src > 10 || dest < 1 || dest > 10 )); then
+  if ! valid_ws "$src" || ! valid_ws "$dest"; then
     echo "workspace ids must be 1..10" >&2
+    emit_status false "invalid-id" "${src:-0}" "${dest:-0}"
     return 2
   fi
   if (( src == dest )); then
+    emit_status true "" "$src" "$dest"
     return 0
   fi
 
-  local TEMP=""
-  TEMP="$(pick_temp "$src" "$dest" || true)"
-  if [[ -z "$TEMP" ]]; then
-    notify "No empty workspace for swap" 2000
+  acquire_lock "$src" "$dest" || return 1
+
+  local snap=""
+  snap="$(snapshot_clients "$src" "$dest")" || {
+    notify "Workspace shift failed" 2000
+    emit_status false "snapshot-failed" "$src" "$dest"
+    focus_workspace "$focus_after"
     return 1
+  }
+
+  local -a SRC_ADDRS=() DEST_ADDRS=()
+  mapfile -t SRC_ADDRS < <(clients_from_snap "$snap" "$src")
+  mapfile -t DEST_ADDRS < <(clients_from_snap "$snap" "$dest")
+
+  local fail=0 addr TEMP=""
+  local need_temp=0
+  if (( ${#SRC_ADDRS[@]} > 0 && ${#DEST_ADDRS[@]} > 0 )); then
+    need_temp=1
   fi
 
-  local -a SRC_ADDRS=() DEST_ADDRS=() TEMP_ADDRS=()
-  mapfile -t SRC_ADDRS < <(clients_on "$src")
-  mapfile -t DEST_ADDRS < <(clients_on "$dest")
-
-  local fail=0 addr
-  for addr in "${SRC_ADDRS[@]}"; do
-    [[ -n "${addr:-}" ]] || continue
-    move_addr "$addr" "$TEMP" || fail=1
-  done
-  for addr in "${DEST_ADDRS[@]}"; do
-    [[ -n "${addr:-}" ]] || continue
-    move_addr "$addr" "$src" || fail=1
-  done
-  mapfile -t TEMP_ADDRS < <(clients_on "$TEMP")
-  for addr in "${TEMP_ADDRS[@]}"; do
-    [[ -n "${addr:-}" ]] || continue
-    move_addr "$addr" "$dest" || fail=1
-  done
-
-  hyprctl dispatch "hl.dsp.focus({ workspace = \"${focus_after}\" })" >/dev/null
+  if (( need_temp )); then
+    TEMP="$(pick_temp "$src" "$dest" || true)"
+    if [[ -z "$TEMP" ]]; then
+      notify "No empty workspace for swap" 2000
+      emit_status false "no-temp" "$src" "$dest"
+      focus_workspace "$focus_after"
+      return 1
+    fi
+    for addr in "${SRC_ADDRS[@]}"; do
+      [[ -n "${addr:-}" ]] || continue
+      move_addr "$addr" "$TEMP" || fail=1
+    done
+    if (( fail == 0 )); then
+      for addr in "${DEST_ADDRS[@]}"; do
+        [[ -n "${addr:-}" ]] || continue
+        move_addr "$addr" "$src" || fail=1
+      done
+    fi
+    if (( fail == 0 )); then
+      for addr in "${SRC_ADDRS[@]}"; do
+        [[ -n "${addr:-}" ]] || continue
+        move_addr "$addr" "$dest" || fail=1
+      done
+    fi
+  else
+    for addr in "${SRC_ADDRS[@]}"; do
+      [[ -n "${addr:-}" ]] || continue
+      move_addr "$addr" "$dest" || fail=1
+    done
+    if (( fail == 0 )); then
+      for addr in "${DEST_ADDRS[@]}"; do
+        [[ -n "${addr:-}" ]] || continue
+        move_addr "$addr" "$src" || fail=1
+      done
+    fi
+  fi
 
   if (( fail )); then
+    local rolled=true
+    if ! rollback_snapshot "$snap"; then
+      rolled=false
+    fi
     notify "Workspace shift failed" 2000
+    focus_workspace "$focus_after"
+    emit_status false "move-failed" "$src" "$dest" "$rolled"
     return 1
   fi
-  swap_labels "$src" "$dest"
+
+  if ! timeout --kill-after=2s 5s python3 "$SAFE_IO" swap-labels "$src" "$dest"; then
+    # Windows already swapped; still report failure so the panel reloads labels
+    # from disk (unchanged) rather than keeping an optimistic UI.
+    notify "Workspace shift labels failed" 2000
+    focus_workspace "$focus_after"
+    emit_status false "label-failed" "$src" "$dest"
+    return 1
+  fi
+
+  focus_workspace "$focus_after"
+  emit_status true "" "$src" "$dest"
   return 0
 }
 
 CMD="${1:-}"
 case "$CMD" in
   left|right)
-    CURRENT="$(hyprctl activeworkspace -j | jq -r '.id')"
-    [[ "$CURRENT" =~ ^[0-9]+$ ]] || exit 1
+    CURRENT="$(hypr_json activeworkspace -j | timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r '.id')"
+    valid_ws "${CURRENT:-}" || exit 1
     if [[ "$CMD" == "left" ]]; then
       NEIGHBOR=$((CURRENT - 1))
       if (( NEIGHBOR < 1 )); then
         notify "Already at workspace 1" 1500
+        emit_status true "at-edge" "$CURRENT" "$CURRENT"
         exit 0
       fi
     else
       NEIGHBOR=$((CURRENT + 1))
       if (( NEIGHBOR > 10 )); then
         notify "Already at workspace 10" 1500
+        emit_status true "at-edge" "$CURRENT" "$CURRENT"
         exit 0
       fi
     fi
-    mapfile -t CURRENT_ADDRS < <(clients_on "$CURRENT")
+    raw="$(hypr_json clients -j)" || exit 1
+    if (( ${#raw} < 2 || ${#raw} >= HYPR_MAX_BYTES )); then
+      emit_status false "snapshot-failed" "$CURRENT" "$NEIGHBOR"
+      exit 1
+    fi
+    mapfile -t CURRENT_ADDRS < <(
+      timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r --argjson ws "$CURRENT" '
+        .[]
+        | select(.workspace.id == $ws and .mapped == true and ((.pinned // false) | not))
+        | select((.address | type) == "string" and (.address | test("^0x[0-9a-fA-F]+$")))
+        | .address
+      ' <<<"$raw"
+    )
     if ((${#CURRENT_ADDRS[@]} == 0)); then
-      hyprctl dispatch "hl.dsp.focus({ workspace = \"${NEIGHBOR}\" })" >/dev/null
+      focus_workspace "$NEIGHBOR"
+      emit_status true "" "$CURRENT" "$NEIGHBOR"
       exit 0
     fi
     swap_workspaces "$CURRENT" "$NEIGHBOR" "$NEIGHBOR" || exit $?
@@ -165,8 +287,8 @@ case "$CMD" in
     SRC="${2:-}"
     DEST="${3:-}"
     [[ -n "$SRC" && -n "$DEST" ]] || usage
-    ORIG="$(hyprctl activeworkspace -j | jq -r '.id')"
-    [[ "$ORIG" =~ ^[0-9]+$ ]] || ORIG="$DEST"
+    ORIG="$(hypr_json activeworkspace -j | timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r '.id' || true)"
+    valid_ws "${ORIG:-}" || ORIG="$DEST"
     swap_workspaces "$SRC" "$DEST" "$ORIG" || exit $?
     ;;
   *)

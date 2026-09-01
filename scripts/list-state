@@ -1,17 +1,45 @@
 #!/usr/bin/env bash
 # Emit counts + workspaces for the panel (active range = 1–5 + live extras).
+# hyprctl/jq are byte-capped and deadline-bounded.
 set -euo pipefail
-clients="$(hyprctl clients -j)"
-workspaces="$(hyprctl workspaces -j)"
-jq -n --argjson clients "$clients" --argjson workspaces "$workspaces" '
+
+MAX_BYTES=2097152
+TIMEOUT_SECS=5
+MAX_ITEMS=512
+
+hypr_json() {
+  timeout --kill-after=2s "${TIMEOUT_SECS}s" hyprctl "$@" | head -c "${MAX_BYTES}"
+}
+
+clients="$(hypr_json clients -j)" || exit 1
+workspaces="$(hypr_json workspaces -j)" || exit 1
+
+if (( ${#clients} < 2 || ${#workspaces} < 2 )); then
+  echo "hyprctl produced empty JSON" >&2
+  exit 1
+fi
+if (( ${#clients} >= MAX_BYTES || ${#workspaces} >= MAX_BYTES )); then
+  echo "hyprctl JSON exceeded ${MAX_BYTES} bytes" >&2
+  exit 1
+fi
+
+timeout --kill-after=2s "${TIMEOUT_SECS}s" jq -n \
+  --argjson clients "$clients" \
+  --argjson workspaces "$workspaces" \
+  --argjson maxItems "$MAX_ITEMS" '
+  def take($n): if length > $n then .[:$n] else . end;
   def counts:
-    reduce ($clients[]?
+    reduce (($clients | take($maxItems))[]?
       | select(.mapped == true and ((.pinned // false) | not))
       | .workspace.id
       | select(. >= 1 and . <= 10)) as $id
     ({}; .["\($id)"] = ((.["\($id)"] // 0) + 1));
   {
     counts: counts,
-    workspaces: ($workspaces | map(select(.id >= 1 and .id <= 10) | {id, windows}))
+    workspaces: (
+      $workspaces
+      | take($maxItems)
+      | map(select((.id | type) == "number" and .id >= 1 and .id <= 10) | {id, windows})
+    )
   }
 '

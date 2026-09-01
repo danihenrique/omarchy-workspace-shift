@@ -1,6 +1,13 @@
 // Pure helpers for workspace rows and the labels/shortcuts config file.
 // Active ids match omarchy.workspaces: always 1–5, plus any other live 1–10.
 
+var MAX_CONFIG_CHARS = 65536
+var MAX_LIST_STATE_CHARS = 2097152
+var MAX_LABEL_KEYS = 32
+var MAX_LABEL_CHARS = 64
+var MAX_SHORTCUT_CHARS = 128
+var MAX_CLIENT_ITEMS = 512
+
 function defaultConfig() {
   return {
     labels: {},
@@ -9,27 +16,48 @@ function defaultConfig() {
   }
 }
 
+function clipShortcut(value, fallback) {
+  if (typeof value !== "string") return fallback
+  var text = value.trim()
+  if (!text || text.length > MAX_SHORTCUT_CHARS) return fallback
+  if (text.indexOf("\n") >= 0 || text.indexOf("\r") >= 0) return fallback
+  return text
+}
+
+function clipLabel(value) {
+  var text = String(value == null ? "" : value).trim()
+  if (text.length > MAX_LABEL_CHARS) text = text.slice(0, MAX_LABEL_CHARS)
+  return text
+}
+
+function workspaceKey(value) {
+  var n = parseInt(String(value), 10)
+  if (!isFinite(n) || n < 1 || n > 10) return null
+  if (String(n) !== String(value).trim()) return null
+  return String(n)
+}
+
 function parseConfig(text) {
   var cfg = defaultConfig()
   if (!text) return cfg
+  if (String(text).length > MAX_CONFIG_CHARS) return cfg
   try {
     var data = JSON.parse(text)
     if (!data || typeof data !== "object") return cfg
     if (data.labels && typeof data.labels === "object")
       cfg.labels = copyMap(data.labels)
-    if (typeof data.shortcutLeft === "string" && data.shortcutLeft.trim())
-      cfg.shortcutLeft = data.shortcutLeft.trim()
-    if (typeof data.shortcutRight === "string" && data.shortcutRight.trim())
-      cfg.shortcutRight = data.shortcutRight.trim()
+    cfg.shortcutLeft = clipShortcut(data.shortcutLeft, cfg.shortcutLeft)
+    cfg.shortcutRight = clipShortcut(data.shortcutRight, cfg.shortcutRight)
   } catch (e) {}
   return cfg
 }
 
 function serializeConfig(cfg) {
+  var defaults = defaultConfig()
   return JSON.stringify({
-    labels: (cfg && cfg.labels) ? cfg.labels : {},
-    shortcutLeft: (cfg && cfg.shortcutLeft) ? cfg.shortcutLeft : defaultConfig().shortcutLeft,
-    shortcutRight: (cfg && cfg.shortcutRight) ? cfg.shortcutRight : defaultConfig().shortcutRight
+    labels: copyMap(cfg && cfg.labels),
+    shortcutLeft: clipShortcut(cfg && cfg.shortcutLeft, defaults.shortcutLeft),
+    shortcutRight: clipShortcut(cfg && cfg.shortcutRight, defaults.shortcutRight)
   }, null, 2) + "\n"
 }
 
@@ -37,8 +65,15 @@ function copyMap(src) {
   var out = {}
   if (!src) return out
   var keys = Object.keys(src)
-  for (var i = 0; i < keys.length; i++)
-    out[keys[i]] = src[keys[i]]
+  var n = 0
+  for (var i = 0; i < keys.length && n < MAX_LABEL_KEYS; i++) {
+    var k = workspaceKey(keys[i])
+    if (!k) continue
+    var label = clipLabel(src[keys[i]])
+    if (!label) continue
+    out[k] = label
+    n++
+  }
   return out
 }
 
@@ -50,8 +85,9 @@ function labelOf(labels, wsId) {
 
 function setLabel(labels, wsId, text) {
   var next = copyMap(labels)
-  var t = String(text || "").trim()
-  var k = String(wsId)
+  var k = workspaceKey(wsId)
+  if (!k) return next
+  var t = clipLabel(text)
   if (t) next[k] = t
   else delete next[k]
   return next
@@ -72,10 +108,12 @@ function swapLabels(labels, a, b) {
 
 function countsFromClients(text) {
   var counts = {}
+  if (!text || String(text).length > MAX_LIST_STATE_CHARS) return counts
   try {
     var clients = JSON.parse(text)
     if (!Array.isArray(clients)) return counts
-    for (var c = 0; c < clients.length; c++) {
+    var n = Math.min(clients.length, MAX_CLIENT_ITEMS)
+    for (var c = 0; c < n; c++) {
       var cl = clients[c]
       if (!cl || cl.mapped !== true) continue
       if (cl.pinned === true) continue
@@ -138,12 +176,34 @@ function windowCountText(n) {
 function parseListState(text) {
   var empty = { counts: {}, workspacesText: "[]" }
   if (!text) return empty
+  if (String(text).length > MAX_LIST_STATE_CHARS) return empty
   try {
     var data = JSON.parse(text)
     if (!data || typeof data !== "object") return empty
+    var counts = {}
+    if (data.counts && typeof data.counts === "object") {
+      var keys = Object.keys(data.counts)
+      for (var i = 0; i < keys.length && i < 10; i++) {
+        var k = workspaceKey(keys[i])
+        if (!k) continue
+        var n = parseInt(data.counts[keys[i]], 10)
+        if (!isFinite(n) || n < 0) n = 0
+        counts[k] = n
+      }
+    }
+    var workspaces = []
+    if (Array.isArray(data.workspaces)) {
+      var wmax = Math.min(data.workspaces.length, 10)
+      for (var w = 0; w < wmax; w++) {
+        var ws = data.workspaces[w]
+        if (!ws || typeof ws.id !== "number") continue
+        if (ws.id < 1 || ws.id > 10) continue
+        workspaces.push({ id: ws.id, windows: typeof ws.windows === "number" ? ws.windows : 0 })
+      }
+    }
     return {
-      counts: data.counts && typeof data.counts === "object" ? data.counts : {},
-      workspacesText: JSON.stringify(data.workspaces || [])
+      counts: counts,
+      workspacesText: JSON.stringify(workspaces)
     }
   } catch (e) {
     return empty

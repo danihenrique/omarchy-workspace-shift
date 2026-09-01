@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import subprocess
 import sys
+
+import safe_io
 
 PLUGIN_ID = "io.github.danihenrique.workspace-shift"
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,53 +17,24 @@ SHIFT = os.path.join(PLUGIN_DIR, "scripts", "workspace-shift")
 BEGIN = f"-- BEGIN {PLUGIN_ID}"
 END = f"-- END {PLUGIN_ID}"
 BINDINGS = os.path.expanduser("~/.config/hypr/bindings.lua")
-CONFIG = os.path.expanduser("~/.config/omarchy/workspace-shift.json")
-DEFAULT_LEFT = "SUPER + SHIFT + comma"
-DEFAULT_RIGHT = "SUPER + SHIFT + period"
+CONFIG = safe_io.CONFIG_DEFAULT
+DEFAULT_LEFT = safe_io.DEFAULT_LEFT
+DEFAULT_RIGHT = safe_io.DEFAULT_RIGHT
 EXTRA_LEFT = "SUPER + less"
 EXTRA_RIGHT = "SUPER + greater"
 OLD_SCRIPT = "omarchy-workspace-shift"
+BINDINGS_MAX = safe_io.BINDINGS_MAX_BYTES
 
 
 def load_config() -> dict:
-    data = {
-        "labels": {},
-        "shortcutLeft": DEFAULT_LEFT,
-        "shortcutRight": DEFAULT_RIGHT,
-    }
     try:
-        with open(CONFIG, encoding="utf-8") as fh:
-            parsed = json.load(fh)
-        if isinstance(parsed, dict):
-            labels = parsed.get("labels")
-            if isinstance(labels, dict):
-                data["labels"] = {str(k): str(v) for k, v in labels.items()}
-            if isinstance(parsed.get("shortcutLeft"), str) and parsed["shortcutLeft"].strip():
-                data["shortcutLeft"] = parsed["shortcutLeft"].strip()
-            if isinstance(parsed.get("shortcutRight"), str) and parsed["shortcutRight"].strip():
-                data["shortcutRight"] = parsed["shortcutRight"].strip()
-    except FileNotFoundError:
-        pass
-    except (json.JSONDecodeError, OSError):
-        pass
-    return data
+        return safe_io.load_config(CONFIG)
+    except OSError:
+        return safe_io.sanitize_config({})
 
 
 def save_config(data: dict) -> None:
-    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-    tmp = CONFIG + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "labels": data.get("labels") or {},
-                "shortcutLeft": data.get("shortcutLeft") or DEFAULT_LEFT,
-                "shortcutRight": data.get("shortcutRight") or DEFAULT_RIGHT,
-            },
-            fh,
-            indent=2,
-        )
-        fh.write("\n")
-    os.replace(tmp, CONFIG)
+    safe_io.save_config(data, CONFIG)
 
 
 def lua_escape(value: str) -> str:
@@ -70,12 +42,7 @@ def lua_escape(value: str) -> str:
 
 
 def sanitize_bind(value: str | None, default: str) -> str:
-    text = (value or "").strip()
-    if not text or any(ch in text for ch in "\n\r\0"):
-        return default
-    if len(text) > 80:
-        return default
-    return text
+    return safe_io.sanitize_shortcut(value, default)
 
 
 def managed_block(left: str, right: str) -> str:
@@ -135,26 +102,28 @@ def strip_old_adhoc(text: str) -> str:
 
 
 def write_bindings(block: str, remove_only: bool) -> None:
-    with open(BINDINGS, encoding="utf-8") as fh:
-        text = fh.read()
-    text = strip_managed(text)
-    text = strip_old_adhoc(text)
-    if not remove_only:
-        screens = "-- BEGIN im0001gt.screens"
-        insertion = block if block.endswith("\n") else block + "\n"
-        if screens in text:
-            text = text.replace(screens, insertion + "\n" + screens, 1)
-        else:
-            text = text.rstrip() + "\n\n" + insertion
-    tmp = BINDINGS + ".tmp"
-    os.makedirs(os.path.dirname(BINDINGS), exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text if text.endswith("\n") else text + "\n")
-    os.replace(tmp, BINDINGS)
+    def transform(text: str) -> str:
+        text = strip_managed(text)
+        text = strip_old_adhoc(text)
+        if not remove_only:
+            screens = "-- BEGIN im0001gt.screens"
+            insertion = block if block.endswith("\n") else block + "\n"
+            if screens in text:
+                text = text.replace(screens, insertion + "\n" + screens, 1)
+            else:
+                text = text.rstrip() + "\n\n" + insertion
+        return text if text.endswith("\n") else text + "\n"
+
+    safe_io.rmw_text(BINDINGS, transform, max_bytes=BINDINGS_MAX, missing_ok=False)
+
+
+def run_timeout(args: list[str], seconds: int = 5) -> subprocess.CompletedProcess:
+    cmd = ["timeout", "--kill-after=2s", f"{seconds}s", *args]
+    return subprocess.run(cmd, check=False)
 
 
 def reload() -> None:
-    subprocess.run(["hyprctl", "reload"], check=False)
+    run_timeout(["hyprctl", "reload"])
 
 
 def main() -> int:
@@ -163,32 +132,47 @@ def main() -> int:
     parser.add_argument("--left", help="Omarchy bind syntax for shift left")
     parser.add_argument("--right", help="Omarchy bind syntax for shift right")
     parser.add_argument("--no-reload", action="store_true")
+    parser.add_argument(
+        "--set-label",
+        nargs=2,
+        metavar=("ID", "TEXT"),
+        help="Set or clear one workspace label in plugin config (empty TEXT clears)",
+    )
     args = parser.parse_args()
 
-    if args.remove:
-        write_bindings("", remove_only=True)
+    try:
+        if args.set_label is not None:
+            ws, text = args.set_label
+            safe_io.set_label_in_config(ws, text, CONFIG)
+            return 0
+
+        if args.remove:
+            write_bindings("", remove_only=True)
+            if not args.no_reload:
+                reload()
+            return 0
+
+        cfg = load_config()
+        left = sanitize_bind(
+            args.left if args.left is not None else cfg.get("shortcutLeft"),
+            DEFAULT_LEFT,
+        )
+        right = sanitize_bind(
+            args.right if args.right is not None else cfg.get("shortcutRight"),
+            DEFAULT_RIGHT,
+        )
+        cfg["shortcutLeft"] = left
+        cfg["shortcutRight"] = right
+        if not isinstance(cfg.get("labels"), dict):
+            cfg["labels"] = {}
+        save_config(cfg)
+        write_bindings(managed_block(left, right), remove_only=False)
         if not args.no_reload:
             reload()
         return 0
-
-    cfg = load_config()
-    left = sanitize_bind(
-        args.left if args.left is not None else cfg.get("shortcutLeft"),
-        DEFAULT_LEFT,
-    )
-    right = sanitize_bind(
-        args.right if args.right is not None else cfg.get("shortcutRight"),
-        DEFAULT_RIGHT,
-    )
-    cfg["shortcutLeft"] = left
-    cfg["shortcutRight"] = right
-    if not isinstance(cfg.get("labels"), dict):
-        cfg["labels"] = {}
-    save_config(cfg)
-    write_bindings(managed_block(left, right), remove_only=False)
-    if not args.no_reload:
-        reload()
-    return 0
+    except (OSError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

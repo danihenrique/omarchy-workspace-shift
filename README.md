@@ -24,6 +24,14 @@ On first enable, the plugin writes a managed bind block into `~/.config/hypr/bin
 ~/.config/omarchy/plugins/io.github.danihenrique.workspace-shift/scripts/apply-binds
 ```
 
+## Manual setup
+
+This plugin **writes a managed block** into `~/.config/hypr/bindings.lua` (markers `-- BEGIN io.github.danihenrique.workspace-shift` / `-- END io.github.danihenrique.workspace-shift`). Review that file after install or after clicking Apply. The plugin does not prompt before writing the block.
+
+Uninstall requires an explicit removal step **before** `omarchy plugin remove`, because the helper that strips the block lives inside the plugin folder (see Uninstall).
+
+Workspace swaps are **best-effort**. Moves are locked and snapshotted; if any window move fails the plugin attempts to roll windows back to their original workspaces and does **not** swap labels. A compositor failure can still leave windows elsewhere — refresh the panel if something looks wrong.
+
 ## Super+Shift+comma
 
 On US QWERTY, `<` is Shift+comma. The panel records the combo you press (e.g. `SUPER + SHIFT + comma`) rather than free-typed bind strings. Apply still also registers extra `SUPER + less` / `SUPER + greater` binds, because Hyprland will register `SUPER + less` but that key does not fire.
@@ -40,11 +48,11 @@ This plugin does **not** replace `omarchy.workspaces`.
 
 ## Uninstall
 
-Strip the Hypr binds *before* removing the plugin (the helper lives in the plugin folder):
+You **must** strip the managed Hypr binds *before* removing the plugin:
 
 ```sh
 ~/.config/omarchy/plugins/io.github.danihenrique.workspace-shift/scripts/apply-binds --remove
 omarchy plugin remove io.github.danihenrique.workspace-shift
 ```
 
-`apply-binds --remove` deletes the block between `-- BEGIN io.github.danihenrique.workspace-shift` and `-- END io.github.danihenrique.workspace-shift` in `~/.config/hypr/bindings.lua`. If you already removed the plugin, delete that block by hand and run `hyprctl reload`.
+`apply-binds --remove` deletes the block between `-- BEGIN io.github.danihenrique.workspace-shift` and `-- END io.github.danihenrique.workspace-shift` in `~/.config/hypr/bindings.lua`. Review that file after removal. If you already removed the plugin, delete that block by hand and run `hyprctl reload`.
