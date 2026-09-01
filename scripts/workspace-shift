@@ -3,9 +3,15 @@
 # Hyprland cannot reorder workspace numbers, so "shift" means exchanging
 # window sets via an empty temp workspace.
 #
-# Moves are locked, snapshotted, and rolled back on failure. Labels swap
-# only after every window has landed. Omarchy: focus each window before
-# moving (address-only moves are flaky).
+# Moves are locked, snapshotted, and rolled back on failure — including if
+# label persist fails after windows have already moved. Omarchy: focus each
+# window before moving (address-only moves are flaky).
+#
+# Temp workspace: under swap.lock, pick an empty id (prefer 8,9,10,7,6,3,
+# then unused 11–99 which Hyprland creates on demand, then remaining 1–5),
+# and re-verify it is still empty immediately before the first move. If it
+# gained windows, pick another or abort. A millisecond compositor TOCTOU
+# between verify and dispatch remains; a failed move rolls the snapshot back.
 set -uo pipefail
 
 usage() {
@@ -21,7 +27,7 @@ HYPR_MAX_BYTES=2097152
 HYPR_TIMEOUT=5
 MAX_CLIENTS=256
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-shift"
-LOCK="${STATE_DIR}/swap.lock"
+_WS_LOCK_HELD=0
 
 notify() {
   local msg="$1"
@@ -53,20 +59,47 @@ valid_ws() {
   [[ "$1" =~ ^[1-9]$|^10$ ]]
 }
 
+valid_move_ws() {
+  [[ "$1" =~ ^[1-9]$|^[1-9][0-9]$ ]]
+}
+
 valid_addr() {
   [[ "$1" =~ ^0x[0-9a-fA-F]+$ ]]
 }
 
-snapshot_clients() {
-  local src="$1" dest="$2"
-  local raw
-  raw="$(hypr_json clients -j)" || return 1
+clients_within_cap() {
+  local raw="$1"
+  local n
   if (( ${#raw} < 2 || ${#raw} >= HYPR_MAX_BYTES )); then
     return 1
   fi
-  timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -c --argjson src "$src" --argjson dest "$dest" --argjson max "$MAX_CLIENTS" '
+  n="$(timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq 'if type=="array" then length else empty end' <<<"$raw")" || return 1
+  if [[ -z "$n" || ! "$n" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if (( n > MAX_CLIENTS )); then
+    return 2
+  fi
+  return 0
+}
+
+load_clients_json() {
+  local raw rc
+  raw="$(hypr_json clients -j)" || return 1
+  clients_within_cap "$raw"
+  rc=$?
+  if (( rc != 0 )); then
+    return "$rc"
+  fi
+  printf '%s' "$raw"
+  return 0
+}
+
+snapshot_clients_from_raw() {
+  local raw="$1" src="$2" dest="$3"
+  timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -c --argjson src "$src" --argjson dest "$dest" '
     [
-      .[:$max][]?
+      .[]?
       | select(.mapped == true and ((.pinned // false) | not))
       | select(.workspace.id == $src or .workspace.id == $dest)
       | select((.address | type) == "string" and (.address | test("^0x[0-9a-fA-F]+$")))
@@ -92,7 +125,7 @@ move_addr() {
   local dest="$2"
   local out now raw
   valid_addr "$addr" || return 1
-  valid_ws "$dest" || return 1
+  valid_move_ws "$dest" || return 1
   hypr_dispatch "hl.dsp.focus({ window = \"address:${addr}\" })" >/dev/null || return 1
   sleep 0.03
   out="$(hypr_dispatch "hl.dsp.window.move({ workspace = \"${dest}\", follow = false })" 2>&1)" || return 1
@@ -117,16 +150,40 @@ rollback_snapshot() {
   return "$fail"
 }
 
-pick_temp() {
+workspace_client_count() {
+  local ws="$1" raw="$2"
+  timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq --argjson ws "$ws" '
+    [.[] | select(.workspace.id == $ws)] | length
+  ' <<<"$raw"
+}
+
+temp_is_empty() {
+  local ws="$1" raw count
+  raw="$(load_clients_json)" || return 1
+  count="$(workspace_client_count "$ws" "$raw")" || return 1
+  [[ "$count" == "0" ]]
+}
+
+# Prefer scratch 8/9/10 then 7,6,3; then unused high ids 11–99 (claimed on
+# demand); then remaining 1–5. Caller re-verifies emptiness before use.
+pick_temp_candidate() {
   local src="$1" dest="$2" candidate count raw
-  raw="$(hypr_json clients -j)" || return 1
-  for candidate in 8 9 10 7 6 3; do
+  raw="$(load_clients_json)" || return 1
+  local -a candidates=()
+  for candidate in 8 9 10 7 6 3 5 4 2 1; do
     if (( candidate == src || candidate == dest )); then
       continue
     fi
-    count="$(timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq --argjson ws "$candidate" '
-      [.[] | select(.workspace.id == $ws)] | length
-    ' <<<"$raw")" || continue
+    candidates+=("$candidate")
+  done
+  for candidate in $(seq 11 99); do
+    if (( candidate == src || candidate == dest )); then
+      continue
+    fi
+    candidates+=("$candidate")
+  done
+  for candidate in "${candidates[@]}"; do
+    count="$(workspace_client_count "$candidate" "$raw")" || continue
     if [[ "$count" == "0" ]]; then
       echo "$candidate"
       return 0
@@ -135,14 +192,57 @@ pick_temp() {
   return 1
 }
 
+claim_temp() {
+  local src="$1" dest="$2" candidate tries=0
+  while (( tries < 20 )); do
+    tries=$((tries + 1))
+    candidate="$(pick_temp_candidate "$src" "$dest" || true)"
+    if [[ -z "$candidate" ]]; then
+      return 1
+    fi
+    # Re-verify under swap.lock immediately before the caller uses TEMP.
+    if temp_is_empty "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 acquire_lock() {
-  mkdir -p -m 700 "$STATE_DIR"
-  exec 9>"$LOCK"
-  if ! flock -w 15 9; then
-    emit_status false "lock-timeout" "${1:-0}" "${2:-0}"
+  local src="${1:-0}" dest="${2:-0}" status=""
+  if (( _WS_LOCK_HELD )); then
+    return 0
+  fi
+  coproc _WS_LOCK {
+    python3 "$SAFE_IO" hold-lock --timeout 15 --state-dir "$STATE_DIR" --name swap.lock
+  }
+  if [[ -z "${_WS_LOCK[0]:-}" ]]; then
+    emit_status false "lock-failed" "$src" "$dest"
     return 1
   fi
+  if ! IFS= read -r -t 16 status <&"${_WS_LOCK[0]}"; then
+    emit_status false "lock-timeout" "$src" "$dest"
+    return 1
+  fi
+  if [[ "$status" != "ok" ]]; then
+    emit_status false "lock-failed" "$src" "$dest"
+    return 1
+  fi
+  _WS_LOCK_HELD=1
   return 0
+}
+
+fail_swap() {
+  local code="$1" src="$2" dest="$3" focus_after="$4" extra="${5:-}"
+  notify "Workspace shift failed" 2000
+  focus_workspace "$focus_after"
+  if [[ -n "$extra" ]]; then
+    emit_status false "$code" "$src" "$dest" "$extra"
+  else
+    emit_status false "$code" "$src" "$dest"
+  fi
+  return 1
 }
 
 swap_workspaces() {
@@ -162,11 +262,21 @@ swap_workspaces() {
 
   acquire_lock "$src" "$dest" || return 1
 
+  local raw="" rc=0
+  raw="$(load_clients_json)"
+  rc=$?
+  if (( rc == 2 )); then
+    fail_swap "too-many-clients" "$src" "$dest" "$focus_after"
+    return 1
+  fi
+  if (( rc != 0 )) || [[ -z "$raw" ]]; then
+    fail_swap "snapshot-failed" "$src" "$dest" "$focus_after"
+    return 1
+  fi
+
   local snap=""
-  snap="$(snapshot_clients "$src" "$dest")" || {
-    notify "Workspace shift failed" 2000
-    emit_status false "snapshot-failed" "$src" "$dest"
-    focus_workspace "$focus_after"
+  snap="$(snapshot_clients_from_raw "$raw" "$src" "$dest")" || {
+    fail_swap "snapshot-failed" "$src" "$dest" "$focus_after"
     return 1
   }
 
@@ -181,11 +291,17 @@ swap_workspaces() {
   fi
 
   if (( need_temp )); then
-    TEMP="$(pick_temp "$src" "$dest" || true)"
+    TEMP="$(claim_temp "$src" "$dest" || true)"
     if [[ -z "$TEMP" ]]; then
       notify "No empty workspace for swap" 2000
-      emit_status false "no-temp" "$src" "$dest"
       focus_workspace "$focus_after"
+      emit_status false "no-temp" "$src" "$dest"
+      return 1
+    fi
+    if ! temp_is_empty "$TEMP"; then
+      notify "No empty workspace for swap" 2000
+      focus_workspace "$focus_after"
+      emit_status false "no-temp" "$src" "$dest"
       return 1
     fi
     for addr in "${SRC_ADDRS[@]}"; do
@@ -229,11 +345,13 @@ swap_workspaces() {
   fi
 
   if ! timeout --kill-after=2s 5s python3 "$SAFE_IO" swap-labels "$src" "$dest"; then
-    # Windows already swapped; still report failure so the panel reloads labels
-    # from disk (unchanged) rather than keeping an optimistic UI.
+    local rolled=true
+    if ! rollback_snapshot "$snap"; then
+      rolled=false
+    fi
     notify "Workspace shift labels failed" 2000
     focus_workspace "$focus_after"
-    emit_status false "label-failed" "$src" "$dest"
+    emit_status false "label-failed" "$src" "$dest" "$rolled"
     return 1
   fi
 
@@ -262,8 +380,13 @@ case "$CMD" in
         exit 0
       fi
     fi
-    raw="$(hypr_json clients -j)" || exit 1
-    if (( ${#raw} < 2 || ${#raw} >= HYPR_MAX_BYTES )); then
+    raw="$(load_clients_json)"
+    rc=$?
+    if (( rc == 2 )); then
+      emit_status false "too-many-clients" "$CURRENT" "$NEIGHBOR"
+      exit 1
+    fi
+    if (( rc != 0 )) || [[ -z "${raw:-}" ]]; then
       emit_status false "snapshot-failed" "$CURRENT" "$NEIGHBOR"
       exit 1
     fi

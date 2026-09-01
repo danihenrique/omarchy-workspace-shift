@@ -30,7 +30,9 @@ This plugin **writes a managed block** into `~/.config/hypr/bindings.lua` (marke
 
 Uninstall requires an explicit removal step **before** `omarchy plugin remove`, because the helper that strips the block lives inside the plugin folder (see Uninstall).
 
-Workspace swaps are **best-effort**. Moves are locked and snapshotted; if any window move fails the plugin attempts to roll windows back to their original workspaces and does **not** swap labels. A compositor failure can still leave windows elsewhere — refresh the panel if something looks wrong.
+Workspace swaps are **best-effort**. Moves take an exclusive descriptor-safe lock (`~/.local/state/omarchy/workspace-shift/swap.lock`, opened with `O_NOFOLLOW` and never truncated through a symlink). Clients are snapshotted first; more than 256 Hyprland clients aborts the swap (fail closed, no partial success). If any window move fails, **or if labels cannot be persisted after a successful move**, the plugin rolls windows back to their original workspaces and does **not** keep a one-sided label swap. A compositor failure can still leave windows elsewhere — refresh the panel if something looks wrong.
+
+Two-way swaps use a temporary empty workspace under that lock. The plugin prefers ids 8/9/10, then 7/6/3, then an unused high id 11–99 (Hyprland creates it on demand), then remaining 1–5. It re-queries immediately before the first move and picks another id (or aborts) if that workspace is no longer empty. External Hyprland changes in the milliseconds between that check and the dispatch cannot be locked out by the compositor; a failed move still rolls back the snapshot.
 
 ## Super+Shift+comma
 

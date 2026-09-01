@@ -2,8 +2,9 @@
 """Secure read/replace for Workspace Shift owned files.
 
 Used by apply-binds (bindings.lua, workspace-shift.json) and by
-workspace-shift for label swaps. Refuses symlinks/FIFOs, checks owner,
+workspace-shift for label swaps and swap.lock. Refuses symlinks/FIFOs, checks owner,
 locks, writes via an unpredictable same-directory temp, preserves mode.
+State dir and swap.lock are opened with O_DIRECTORY|O_NOFOLLOW (no truncation).
 """
 
 from __future__ import annotations
@@ -13,9 +14,11 @@ import errno
 import fcntl
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -85,6 +88,161 @@ def _open_lock(dirfd: int, name: str) -> int:
         os.close(lock_fd)
         raise
     return lock_fd
+
+
+LOCK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+STATE_CREATE_TAIL = 2  # only create omarchy/workspace-shift under the XDG state base
+
+
+def default_state_dir() -> str:
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg and os.path.isabs(xdg):
+        base = xdg
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "omarchy", "workspace-shift")
+
+
+def _open_or_mkdir_component(dirfd: int, name: str, flags: int, may_create: bool, mode: int) -> int:
+    try:
+        return os.open(name, flags, dir_fd=dirfd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise OSError(errno.ELOOP, f"refusing symlink or non-directory path component: {name}") from exc
+        if exc.errno != errno.ENOENT or not may_create:
+            raise
+    try:
+        os.mkdir(name, mode, dir_fd=dirfd)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+    try:
+        return os.open(name, flags, dir_fd=dirfd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise OSError(errno.ELOOP, f"refusing symlink or non-directory path component: {name}") from exc
+        raise
+
+
+def ensure_state_dir(path: str | None = None, *, create_tail: int = STATE_CREATE_TAIL, mode: int = 0o700) -> int:
+    """Open state dir with O_DIRECTORY|O_NOFOLLOW; refuse any symlink component.
+
+    Walks from / so a pre-positioned symlink in the path cannot be followed.
+    Only the last `create_tail` components (omarchy/workspace-shift) may be created.
+    The leaf directory must be owned by euid.
+    """
+    path = os.path.abspath(path or default_state_dir())
+    if not os.path.isabs(path):
+        raise OSError(errno.EINVAL, f"state dir must be absolute: {path}")
+    parts = [p for p in path.split(os.sep) if p]
+    if not parts:
+        raise OSError(errno.EINVAL, "refusing filesystem root as state dir")
+    flags = _cloexec_nofollow(os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open("/", flags)
+    n = len(parts)
+    try:
+        for i, part in enumerate(parts):
+            may_create = (n - i) <= create_tail
+            next_fd = _open_or_mkdir_component(fd, part, flags, may_create, mode)
+            os.close(fd)
+            fd = next_fd
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(errno.ENOTDIR, f"state path is not a directory: {path}")
+        if st.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, f"state directory not owned by current user: {path}")
+        return fd
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _valid_lock_name(name: str) -> bool:
+    return bool(name) and LOCK_NAME_RE.fullmatch(name) is not None and name not in (".", "..")
+
+
+def _flock_ex(fd: int, timeout: float) -> None:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EINTR):
+                raise
+        if time.monotonic() >= deadline:
+            raise TimeoutError("lock-timeout")
+        time.sleep(0.05)
+
+
+def open_state_lock(dirfd: int, name: str, timeout: float = 15.0) -> int:
+    """Open lock with O_NOFOLLOW|O_CREAT (never O_TRUNC). Regular file, owner==euid, flock EX."""
+    if not _valid_lock_name(name):
+        raise OSError(errno.EINVAL, f"invalid lock name: {name}")
+    flags = _cloexec_nofollow(os.O_RDWR | os.O_CREAT)
+    try:
+        lock_fd = os.open(name, flags, DEFAULT_MODE, dir_fd=dirfd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO, errno.ENOTDIR):
+            raise OSError(errno.EPERM, f"refusing lock path that is not a regular file: {name}") from exc
+        raise
+    try:
+        st = os.fstat(lock_fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EPERM, f"lock path is not a regular file: {name}")
+        if st.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, f"lock file not owned by current user: {name}")
+        _flock_ex(lock_fd, timeout)
+    except Exception:
+        os.close(lock_fd)
+        raise
+    return lock_fd
+
+
+def hold_lock(state_dir: str | None = None, name: str = "swap.lock", timeout: float = 15.0) -> int:
+    """Acquire the swap lock and hold it until stdin EOF. Prints 'ok' or 'error' on stdout."""
+    dirfd = None
+    lock_fd = None
+    try:
+        dirfd = ensure_state_dir(state_dir)
+        lock_fd = open_state_lock(dirfd, name, timeout=timeout)
+        sys.stdout.write("ok\n")
+        sys.stdout.flush()
+        try:
+            sys.stdin.buffer.read()
+        except (BrokenPipeError, OSError):
+            pass
+        return 0
+    except TimeoutError as exc:
+        sys.stdout.write("error\n")
+        sys.stdout.flush()
+        print(str(exc), file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        sys.stdout.write("error\n")
+        sys.stdout.flush()
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        if dirfd is not None:
+            try:
+                os.close(dirfd)
+            except OSError:
+                pass
 
 
 def _open_target(dirfd: int, name: str, path: str, *, write: bool) -> int | None:
@@ -431,6 +589,11 @@ def main(argv: list[str] | None = None) -> int:
     p_set.add_argument("text", nargs="?", default="")
     p_set.add_argument("--config", default=CONFIG_DEFAULT)
 
+    p_lock = sub.add_parser("hold-lock", help="Hold swap.lock until stdin closes (descriptor-safe)")
+    p_lock.add_argument("--state-dir", default=None)
+    p_lock.add_argument("--name", default="swap.lock")
+    p_lock.add_argument("--timeout", type=float, default=15.0)
+
     args = parser.parse_args(argv)
     try:
         if args.cmd == "read":
@@ -448,6 +611,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "set-label":
             set_label_in_config(args.ws, args.text, path=args.config)
             return 0
+        if args.cmd == "hold-lock":
+            return hold_lock(args.state_dir, args.name, args.timeout)
     except (OSError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
