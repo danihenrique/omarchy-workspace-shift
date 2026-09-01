@@ -81,8 +81,17 @@ Panel {
     Qt.callLater(function() { root.writingConfig = false })
   }
 
+  property string workspacesText: "[]"
+
+  function indexOfWs(wsId) {
+    for (var i = 0; i < rows.count; i++) {
+      if (rows.get(i).wsId === wsId) return i
+    }
+    return -1
+  }
+
   function applySnapshot() {
-    var list = Model.snapshot(root.labels, root.counts)
+    var list = Model.snapshot(root.labels, root.counts, root.workspacesText)
     if (rows.count !== list.length) {
       rows.clear()
       for (var i = 0; i < list.length; i++)
@@ -96,8 +105,10 @@ Panel {
     }
   }
 
-  function applyClients(text) {
-    root.counts = Model.countsFromClients(text)
+  function applyListState(text) {
+    var state = Model.parseListState(text)
+    root.counts = state.counts
+    root.workspacesText = state.workspacesText
     root.applySnapshot()
   }
 
@@ -109,8 +120,8 @@ Panel {
 
   function commitLabel(wsId, text) {
     root.labels = Model.setLabel(root.labels, wsId, text)
-    var idx = wsId - 1
-    if (idx >= 0 && idx < rows.count)
+    var idx = root.indexOfWs(wsId)
+    if (idx >= 0)
       rows.setProperty(idx, "label", Model.labelOf(root.labels, wsId))
     root.saveConfig()
   }
@@ -118,9 +129,9 @@ Panel {
   function swapNeighbor(a, b) {
     if (a < 1 || b < 1 || a > 10 || b > 10 || a === b) return
     root.labels = Model.swapLabels(root.labels, a, b)
-    var ia = a - 1
-    var ib = b - 1
-    if (ia >= 0 && ib >= 0 && ia < rows.count && ib < rows.count) {
+    var ia = root.indexOfWs(a)
+    var ib = root.indexOfWs(b)
+    if (ia >= 0 && ib >= 0) {
       var la = rows.get(ia).label
       var lb = rows.get(ib).label
       var wa = rows.get(ia).windows
@@ -135,24 +146,29 @@ Panel {
   }
 
   function moveWorkspace(wsId, direction) {
-    var dest = wsId + direction
-    if (dest < 1 || dest > 10) return
-    root.swapNeighbor(wsId, dest)
+    var idx = root.indexOfWs(wsId)
+    if (idx < 0) return
+    var other = idx + direction
+    if (other < 0 || other >= rows.count) return
+    root.swapNeighbor(wsId, rows.get(other).wsId)
   }
 
   function shiftRow(index, steps) {
-    var id = index + 1
+    if (index < 0 || index >= rows.count) return
+    var id = rows.get(index).wsId
     if (steps > 0) {
       for (var i = 0; i < steps; i++) {
-        if (id >= 10) break
-        root.swapNeighbor(id, id + 1)
-        id += 1
+        var cur = root.indexOfWs(id)
+        if (cur < 0 || cur >= rows.count - 1) break
+        var nextId = rows.get(cur + 1).wsId
+        root.swapNeighbor(id, nextId)
       }
     } else if (steps < 0) {
       for (var j = 0; j < -steps; j++) {
-        if (id <= 1) break
-        root.swapNeighbor(id, id - 1)
-        id -= 1
+        var cur2 = root.indexOfWs(id)
+        if (cur2 <= 0) break
+        var prevId = rows.get(cur2 - 1).wsId
+        root.swapNeighbor(id, prevId)
       }
     }
   }
@@ -211,10 +227,10 @@ Panel {
 
   Process {
     id: refreshProc
-    command: ["hyprctl", "clients", "-j"]
+    command: [root.pluginDir + "/scripts/list-state"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyClients(text)
+      onStreamFinished: root.applyListState(text)
     }
   }
 
@@ -381,7 +397,7 @@ Panel {
                 tooltipText: "Swap with workspace above"
                 foreground: root.contentForeground
                 fontFamily: root.contentFontFamily
-                enabled: row.wsId > 1 && !root.busy
+                enabled: index > 0 && !root.busy
                 onClicked: root.moveWorkspace(row.wsId, -1)
               }
 
@@ -391,7 +407,7 @@ Panel {
                 tooltipText: "Swap with workspace below"
                 foreground: root.contentForeground
                 fontFamily: root.contentFontFamily
-                enabled: row.wsId < 10 && !root.busy
+                enabled: index < rows.count - 1 && !root.busy
                 onClicked: root.moveWorkspace(row.wsId, 1)
               }
 

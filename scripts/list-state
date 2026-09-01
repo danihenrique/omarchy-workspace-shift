@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Emit counts + workspaces for the panel (active range = 1–5 + live extras).
+set -euo pipefail
+clients="$(hyprctl clients -j)"
+workspaces="$(hyprctl workspaces -j)"
+jq -n --argjson clients "$clients" --argjson workspaces "$workspaces" '
+  def counts:
+    reduce ($clients[]?
+      | select(.mapped == true and ((.pinned // false) | not))
+      | .workspace.id
+      | select(. >= 1 and . <= 10)) as $id
+    ({}; .["\($id)"] = ((.["\($id)"] // 0) + 1));
+  {
+    counts: counts,
+    workspaces: ($workspaces | map(select(.id >= 1 and .id <= 10) | {id, windows}))
+  }
+'

@@ -2,13 +2,17 @@
   "schemaVersion": 1,
   "id": "io.github.danihenrique.workspace-shift",
   "name": "Workspace Shift",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Daniel Henrique",
   "license": "MIT",
   "homepage": "https://github.com/danihenrique/omarchy-workspace-shift",
   "description": "Reorder Omarchy workspaces by swapping window sets, with labels and Super+Shift+,/. shortcuts.",
-  "kinds": ["bar-widget"],
-  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
   "barWidget": {
     "displayName": "Workspace Shift",
     "description": "Swap workspace contents, rename workspaces, and bind Super+Shift+,/.",
