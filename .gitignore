@@ -1,0 +1,6 @@
+# Local agent/tooling caches
+.atl/
+*.qmlc
+.qmlcache/
+__pycache__/
+*.pyc

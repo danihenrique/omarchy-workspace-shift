@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Write or strip the Hyprland bind block owned by Workspace Shift."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+PLUGIN_ID = "io.github.danihenrique.workspace-shift"
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SHIFT = os.path.join(PLUGIN_DIR, "scripts", "workspace-shift")
+BEGIN = f"-- BEGIN {PLUGIN_ID}"
+END = f"-- END {PLUGIN_ID}"
+BINDINGS = os.path.expanduser("~/.config/hypr/bindings.lua")
+CONFIG = os.path.expanduser("~/.config/omarchy/workspace-shift.json")
+DEFAULT_LEFT = "SUPER + SHIFT + comma"
+DEFAULT_RIGHT = "SUPER + SHIFT + period"
+EXTRA_LEFT = "SUPER + less"
+EXTRA_RIGHT = "SUPER + greater"
+OLD_SCRIPT = "omarchy-workspace-shift"
+
+
+def load_config() -> dict:
+    data = {
+        "labels": {},
+        "shortcutLeft": DEFAULT_LEFT,
+        "shortcutRight": DEFAULT_RIGHT,
+    }
+    try:
+        with open(CONFIG, encoding="utf-8") as fh:
+            parsed = json.load(fh)
+        if isinstance(parsed, dict):
+            labels = parsed.get("labels")
+            if isinstance(labels, dict):
+                data["labels"] = {str(k): str(v) for k, v in labels.items()}
+            if isinstance(parsed.get("shortcutLeft"), str) and parsed["shortcutLeft"].strip():
+                data["shortcutLeft"] = parsed["shortcutLeft"].strip()
+            if isinstance(parsed.get("shortcutRight"), str) and parsed["shortcutRight"].strip():
+                data["shortcutRight"] = parsed["shortcutRight"].strip()
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, OSError):
+        pass
+    return data
+
+
+def save_config(data: dict) -> None:
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "labels": data.get("labels") or {},
+                "shortcutLeft": data.get("shortcutLeft") or DEFAULT_LEFT,
+                "shortcutRight": data.get("shortcutRight") or DEFAULT_RIGHT,
+            },
+            fh,
+            indent=2,
+        )
+        fh.write("\n")
+    os.replace(tmp, CONFIG)
+
+
+def lua_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def sanitize_bind(value: str | None, default: str) -> str:
+    text = (value or "").strip()
+    if not text or any(ch in text for ch in "\n\r\0"):
+        return default
+    if len(text) > 80:
+        return default
+    return text
+
+
+def managed_block(left: str, right: str) -> str:
+    left = sanitize_bind(left, DEFAULT_LEFT)
+    right = sanitize_bind(right, DEFAULT_RIGHT)
+    keys: list[str] = []
+    for key in (left, right, EXTRA_LEFT, EXTRA_RIGHT):
+        if key not in keys:
+            keys.append(key)
+    lines = [BEGIN]
+    for key in keys:
+        lines.append(f'hl.unbind("{lua_escape(key)}")')
+    lines.append(
+        f'o.bind("{lua_escape(left)}", "Shift workspace left", "{lua_escape(SHIFT)} left")'
+    )
+    lines.append(
+        f'o.bind("{lua_escape(right)}", "Shift workspace right", "{lua_escape(SHIFT)} right")'
+    )
+    if left != EXTRA_LEFT:
+        lines.append(
+            f'o.bind("{lua_escape(EXTRA_LEFT)}", "Shift workspace left", "{lua_escape(SHIFT)} left")'
+        )
+    if right != EXTRA_RIGHT:
+        lines.append(
+            f'o.bind("{lua_escape(EXTRA_RIGHT)}", "Shift workspace right", "{lua_escape(SHIFT)} right")'
+        )
+    lines.append(END)
+    return "\n".join(lines) + "\n"
+
+
+def strip_managed(text: str) -> str:
+    return re.sub(
+        r"\n*" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n*",
+        "\n",
+        text,
+        flags=re.S,
+    )
+
+
+def strip_old_adhoc(text: str) -> str:
+    text = re.sub(
+        r"\n*-- Shift whole workspace left/right\..*?(?=\n-- BEGIN |\Z)",
+        "\n",
+        text,
+        flags=re.S,
+    )
+    kept: list[str] = []
+    for line in text.splitlines(True):
+        if OLD_SCRIPT in line:
+            continue
+        if SHIFT in line and "o.bind(" in line:
+            continue
+        kept.append(line)
+    text = "".join(kept)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.rstrip() + "\n"
+
+
+def write_bindings(block: str, remove_only: bool) -> None:
+    with open(BINDINGS, encoding="utf-8") as fh:
+        text = fh.read()
+    text = strip_managed(text)
+    text = strip_old_adhoc(text)
+    if not remove_only:
+        screens = "-- BEGIN im0001gt.screens"
+        insertion = block if block.endswith("\n") else block + "\n"
+        if screens in text:
+            text = text.replace(screens, insertion + "\n" + screens, 1)
+        else:
+            text = text.rstrip() + "\n\n" + insertion
+    tmp = BINDINGS + ".tmp"
+    os.makedirs(os.path.dirname(BINDINGS), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+    os.replace(tmp, BINDINGS)
+
+
+def reload() -> None:
+    subprocess.run(["hyprctl", "reload"], check=False)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Install or remove Workspace Shift Hypr binds")
+    parser.add_argument("--remove", action="store_true", help="Strip the managed bind block")
+    parser.add_argument("--left", help="Omarchy bind syntax for shift left")
+    parser.add_argument("--right", help="Omarchy bind syntax for shift right")
+    parser.add_argument("--no-reload", action="store_true")
+    args = parser.parse_args()
+
+    if args.remove:
+        write_bindings("", remove_only=True)
+        if not args.no_reload:
+            reload()
+        return 0
+
+    cfg = load_config()
+    left = sanitize_bind(
+        args.left if args.left is not None else cfg.get("shortcutLeft"),
+        DEFAULT_LEFT,
+    )
+    right = sanitize_bind(
+        args.right if args.right is not None else cfg.get("shortcutRight"),
+        DEFAULT_RIGHT,
+    )
+    cfg["shortcutLeft"] = left
+    cfg["shortcutRight"] = right
+    if not isinstance(cfg.get("labels"), dict):
+        cfg["labels"] = {}
+    save_config(cfg)
+    write_bindings(managed_block(left, right), remove_only=False)
+    if not args.no_reload:
+        reload()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

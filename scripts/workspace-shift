@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Swap mapped, non-pinned windows between two numeric Hyprland workspaces.
+# Hyprland cannot reorder workspace numbers, so "shift" means exchanging
+# window sets via an empty temp workspace.
+#
+# Omarchy: focus each window before moving (address-only moves are flaky).
+set -u
+
+usage() {
+  echo "usage: $(basename "$0") left|right" >&2
+  echo "       $(basename "$0") swap SRC DEST" >&2
+  exit 2
+}
+
+NOTIFY_GLYPH=$'\U000f08ac'
+
+notify() {
+  local msg="$1"
+  local timeout="${2:-1500}"
+  omarchy-notification-send -g "$NOTIFY_GLYPH" "$msg" -t "$timeout" || true
+}
+
+clients_on() {
+  hyprctl clients -j | jq -r --argjson ws "$1" '
+    .[]
+    | select(.workspace.id == $ws and .mapped == true and ((.pinned // false) | not))
+    | .address'
+}
+
+pick_temp() {
+  local src="$1" dest="$2" candidate count
+  for candidate in 8 9 10 7 6 3; do
+    if (( candidate == src || candidate == dest )); then
+      continue
+    fi
+    count="$(hyprctl clients -j | jq --argjson ws "$candidate" '[.[] | select(.workspace.id == $ws)] | length')"
+    if [[ "$count" == "0" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+move_addr() {
+  local addr="$1"
+  local dest="$2"
+  local out now
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:${addr}\" })" >/dev/null || return 1
+  sleep 0.03
+  out="$(hyprctl dispatch "hl.dsp.window.move({ workspace = \"${dest}\", follow = false })" 2>&1)"
+  [[ "$out" == "ok" ]] || return 1
+  sleep 0.03
+  now="$(hyprctl clients -j | jq -r --arg a "$addr" '.[] | select(.address == $a) | .workspace.id')"
+  [[ "$now" == "$dest" ]]
+}
+
+swap_workspaces() {
+  local src="$1"
+  local dest="$2"
+  local focus_after="${3:-$dest}"
+
+  if [[ ! "$src" =~ ^[0-9]+$ || ! "$dest" =~ ^[0-9]+$ ]]; then
+    echo "workspace ids must be numeric" >&2
+    return 2
+  fi
+  if (( src < 1 || src > 10 || dest < 1 || dest > 10 )); then
+    echo "workspace ids must be 1..10" >&2
+    return 2
+  fi
+  if (( src == dest )); then
+    return 0
+  fi
+
+  local TEMP=""
+  TEMP="$(pick_temp "$src" "$dest" || true)"
+  if [[ -z "$TEMP" ]]; then
+    notify "No empty workspace for swap" 2000
+    return 1
+  fi
+
+  local -a SRC_ADDRS=() DEST_ADDRS=() TEMP_ADDRS=()
+  mapfile -t SRC_ADDRS < <(clients_on "$src")
+  mapfile -t DEST_ADDRS < <(clients_on "$dest")
+
+  local fail=0 addr
+  for addr in "${SRC_ADDRS[@]}"; do
+    [[ -n "${addr:-}" ]] || continue
+    move_addr "$addr" "$TEMP" || fail=1
+  done
+  for addr in "${DEST_ADDRS[@]}"; do
+    [[ -n "${addr:-}" ]] || continue
+    move_addr "$addr" "$src" || fail=1
+  done
+  mapfile -t TEMP_ADDRS < <(clients_on "$TEMP")
+  for addr in "${TEMP_ADDRS[@]}"; do
+    [[ -n "${addr:-}" ]] || continue
+    move_addr "$addr" "$dest" || fail=1
+  done
+
+  hyprctl dispatch "hl.dsp.focus({ workspace = \"${focus_after}\" })" >/dev/null
+
+  if (( fail )); then
+    notify "Workspace shift failed" 2000
+    return 1
+  fi
+  return 0
+}
+
+CMD="${1:-}"
+case "$CMD" in
+  left|right)
+    CURRENT="$(hyprctl activeworkspace -j | jq -r '.id')"
+    [[ "$CURRENT" =~ ^[0-9]+$ ]] || exit 1
+    if [[ "$CMD" == "left" ]]; then
+      NEIGHBOR=$((CURRENT - 1))
+      if (( NEIGHBOR < 1 )); then
+        notify "Already at workspace 1" 1500
+        exit 0
+      fi
+    else
+      NEIGHBOR=$((CURRENT + 1))
+      if (( NEIGHBOR > 10 )); then
+        notify "Already at workspace 10" 1500
+        exit 0
+      fi
+    fi
+    mapfile -t CURRENT_ADDRS < <(clients_on "$CURRENT")
+    if ((${#CURRENT_ADDRS[@]} == 0)); then
+      hyprctl dispatch "hl.dsp.focus({ workspace = \"${NEIGHBOR}\" })" >/dev/null
+      exit 0
+    fi
+    swap_workspaces "$CURRENT" "$NEIGHBOR" "$NEIGHBOR" || exit $?
+    notify "Workspace ${CURRENT} → ${NEIGHBOR}" 1200
+    ;;
+  swap)
+    SRC="${2:-}"
+    DEST="${3:-}"
+    [[ -n "$SRC" && -n "$DEST" ]] || usage
+    ORIG="$(hyprctl activeworkspace -j | jq -r '.id')"
+    [[ "$ORIG" =~ ^[0-9]+$ ]] || ORIG="$DEST"
+    swap_workspaces "$SRC" "$DEST" "$ORIG" || exit $?
+    ;;
+  *)
+    usage
+    ;;
+esac
