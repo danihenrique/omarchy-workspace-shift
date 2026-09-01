@@ -1,5 +1,7 @@
 # Workspace Shift
 
+![Workspace Shift panel](preview.png)
+
 Reorder Omarchy workspaces by swapping their windows. Hyprland cannot renumber workspaces, and the built-in `omarchy.workspaces` widget stays numeric — this plugin exchanges the mapped, non-pinned windows (and your labels) between two ids instead. The panel lists the same active range as the bar (always 1–5, plus any higher live workspace up to 10), including empty slots in the middle.
 
 Click the bar icon to rename workspaces, move a row up or down, or drag the handle. Default Super+Shift+, and Super+Shift+. swap the current workspace with its neighbor; click a shortcut in the panel and press a combo to change it.
