@@ -175,6 +175,7 @@ Panel {
 
   function swapNeighbor(a, b) {
     if (a < 1 || b < 1 || a > 10 || b > 10 || a === b) return
+    // Optimistic UI only — scripts/workspace-shift persists label swap with windows.
     root.labels = Model.swapLabels(root.labels, a, b)
     var ia = root.indexOfWs(a)
     var ib = root.indexOfWs(b)
@@ -188,7 +189,6 @@ Panel {
       rows.setProperty(ia, "windows", wb)
       rows.setProperty(ib, "windows", wa)
     }
-    root.saveConfig()
     root.enqueueSwap(a, b)
   }
 
@@ -286,10 +286,12 @@ Panel {
         root.status = "Swap failed"
         root.statusIsError = true
         root.swapQueue = []
+        configFile.reload()
         refreshProc.running = true
         return
       }
       root.status = ""
+      configFile.reload()
       root.drainSwap()
     }
   }

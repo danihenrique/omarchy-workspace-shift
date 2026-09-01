@@ -32,7 +32,7 @@ On US QWERTY, `<` is Shift+comma. The panel records the combo you press (e.g. `S
 
 - **Bar icon** — open the Workspaces panel
 - **Labels** — edit a row and it saves immediately to `~/.config/omarchy/workspace-shift.json`
-- **Up / down / drag** — swap that workspace's windows *and* label with the neighbor. Workspace numbers stay numeric; empty slots in the active range stay visible.
+- **Up / down / drag / Super+Shift+,.** — swap that workspace's windows *and* label with the neighbor (labels travel with the window set). Workspace numbers stay numeric; empty slots in the active range stay visible.
 - **Shortcuts** — click Left or Right, then press a combination that includes Super, Ctrl, or Alt. The control records Omarchy `o.bind` syntax and applies immediately. Apply re-applies the current binds.
 - **CLI** — `scripts/workspace-shift left|right` or `scripts/workspace-shift swap SRC DEST`
 

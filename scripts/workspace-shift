@@ -20,6 +20,33 @@ notify() {
   omarchy-notification-send -g "$NOTIFY_GLYPH" "$msg" -t "$timeout" || true
 }
 
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/workspace-shift.json"
+
+# Labels travel with the window set: after swapping workspaces A and B,
+# label(A) and label(B) exchange too.
+swap_labels() {
+  local a="$1" b="$2"
+  local tmp dir
+  [[ -f "$CONFIG" ]] || return 0
+  dir="$(dirname "$CONFIG")"
+  mkdir -p "$dir"
+  tmp="$(mktemp "$dir/workspace-shift.XXXXXX")"
+  if jq --arg a "$a" --arg b "$b" '
+      .labels = (.labels // {})
+      | . as $root
+      | ($root.labels[$a] // null) as $la
+      | ($root.labels[$b] // null) as $lb
+      | .labels[$a] = $lb
+      | .labels[$b] = $la
+      | if .labels[$a] == null then del(.labels[$a]) else . end
+      | if .labels[$b] == null then del(.labels[$b]) else . end
+    ' "$CONFIG" >"$tmp"; then
+    mv "$tmp" "$CONFIG"
+  else
+    rm -f "$tmp"
+  fi
+}
+
 clients_on() {
   hyprctl clients -j | jq -r --argjson ws "$1" '
     .[]
@@ -104,6 +131,7 @@ swap_workspaces() {
     notify "Workspace shift failed" 2000
     return 1
   fi
+  swap_labels "$src" "$dest"
   return 0
 }
 
