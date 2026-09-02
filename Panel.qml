@@ -10,6 +10,7 @@ Panel {
   id: root
   moduleName: "io.github.danihenrique.workspace-shift"
   manageIpc: false
+  Component.onCompleted: root.reloadConfig()
 
   property var anchorItem: null
   property var hostWidget: null
@@ -23,8 +24,10 @@ Panel {
   readonly property string shiftScript: pluginDir + "/scripts/workspace-shift"
   readonly property string applyScript: pluginDir + "/scripts/apply-binds"
   readonly property string timeoutWrap: pluginDir + "/scripts/with-timeout"
+  readonly property string safeIo: pluginDir + "/scripts/safe_io.py"
   readonly property string configPath: Quickshell.env("HOME") + "/.config/omarchy/workspace-shift.json"
   readonly property int maxProcessOutput: 2097152
+  readonly property int maxConfigBytes: 65536
   readonly property int processDeadlineMs: 16000
 
   property var labels: ({})
@@ -60,6 +63,7 @@ Panel {
     }
     root.status = ""
     root.stopRecording()
+    root.reloadConfig()
     root.refresh()
   }
 
@@ -134,8 +138,16 @@ Panel {
   }
 
   property var pendingLabel: null
+  property bool configLoaded: false
+  property string configReadBuf: ""
 
   property string workspacesText: "[]"
+
+  function reloadConfig() {
+    if (configReadProc.running || root.writingConfig) return
+    configReadWatchdog.restart()
+    configReadProc.running = true
+  }
 
   function indexOfWs(wsId) {
     for (var i = 0; i < rows.count; i++) {
@@ -169,6 +181,7 @@ Panel {
   function refresh() {
     if (refreshProc.running || swapProc.running || root.swapQueue.length > 0) return
     if (root.fieldsFocused) return
+    root.reloadConfig()
     refreshProc.running = true
   }
 
@@ -265,22 +278,44 @@ Panel {
 
   ListModel { id: rows }
 
-  FileView {
-    id: configFile
-    path: root.configPath
-    watchChanges: true
-    atomicWrites: false  // writes go through apply-binds / safe_io
-    printErrors: false
-    onLoaded: {
-      if (root.writingConfig) return
-      root.applyConfigText(text())
+  // Bounded no-follow config read. Oversize is rejected in safe_io.py
+  // (exit 3, no stdout) before QML materializes file contents.
+  Process {
+    id: configReadProc
+    command: [root.timeoutWrap, "5", root.safeIo, "read", root.configPath, "--max-bytes", "65536"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.configReadBuf = text || ""
+      }
     }
-    onLoadFailed: {
-      if (root.writingConfig) return
-      root.applyConfigText("")
+    onRunningChanged: {
+      if (running) configReadWatchdog.restart()
+      else configReadWatchdog.stop()
     }
-    onFileChanged: reload()
-    Component.onCompleted: reload()
+    onExited: function(exitCode) {
+      configReadWatchdog.stop()
+      var text = root.configReadBuf
+      root.configReadBuf = ""
+      if (text.length > root.maxConfigBytes || exitCode === 3) {
+        root.status = "Config too large"
+        root.statusIsError = true
+        return
+      }
+      if (exitCode !== 0) {
+        if (!root.configLoaded) {
+          root.applyConfigText("")
+          root.configLoaded = true
+        } else {
+          root.status = "Could not read config"
+          root.statusIsError = true
+        }
+        return
+      }
+      root.configLoaded = true
+      if (root.writingConfig) return
+      root.applyConfigText(text)
+    }
   }
 
   Process {
@@ -315,12 +350,12 @@ Panel {
         root.status = (exitCode === 124 || exitCode === 137) ? "Swap timed out" : "Swap failed"
         root.statusIsError = true
         root.swapQueue = []
-        configFile.reload()
+        root.reloadConfig()
         if (!refreshProc.running) refreshProc.running = true
         return
       }
       root.status = ""
-      configFile.reload()
+      root.reloadConfig()
       root.drainSwap()
     }
   }
@@ -365,7 +400,7 @@ Panel {
         swapProc.running = false
         root.failTimedOut("Swap")
         root.swapQueue = []
-        configFile.reload()
+        root.reloadConfig()
         if (!refreshProc.running) refreshProc.running = true
       }
     }
@@ -401,6 +436,15 @@ Panel {
         labelSaveProc.running = false
         root.failTimedOut("Save")
       }
+    }
+  }
+
+  Timer {
+    id: configReadWatchdog
+    interval: root.processDeadlineMs
+    repeat: false
+    onTriggered: {
+      if (configReadProc.running) configReadProc.running = false
     }
   }
 

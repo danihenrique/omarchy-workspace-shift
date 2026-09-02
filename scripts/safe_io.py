@@ -4,7 +4,12 @@
 Used by apply-binds (bindings.lua, workspace-shift.json) and by
 workspace-shift for label swaps and swap.lock. Refuses symlinks/FIFOs, checks owner,
 locks, writes via an unpredictable same-directory temp, preserves mode.
-State dir and swap.lock are opened with O_DIRECTORY|O_NOFOLLOW (no truncation).
+
+Every writable path is opened with a root-to-leaf openat/O_NOFOLLOW walk.
+Missing dirs are created only via mkdirat on that walk — never os.makedirs.
+Replace is committed only after a successful directory fsync; on post-replace
+failure the previous bytes are restored. Identity (dev/ino/mtime/size/hash)
+from the locked read is rechecked immediately before os.replace.
 """
 
 from __future__ import annotations
@@ -12,12 +17,12 @@ from __future__ import annotations
 import argparse
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
 import stat
 import sys
-import tempfile
 import time
 from collections.abc import Callable
 from typing import Any
@@ -30,7 +35,19 @@ MAX_LABEL_CHARS = 64
 MAX_SHORTCUT_CHARS = 128
 DEFAULT_LEFT = "SUPER + SHIFT + comma"
 DEFAULT_RIGHT = "SUPER + SHIFT + period"
-CONFIG_DEFAULT = os.path.expanduser("~/.config/omarchy/workspace-shift.json")
+LOCK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+STATE_CREATE_TAIL = 2  # only create omarchy/workspace-shift under the XDG state base
+PARENT_CREATE_TAIL = 1  # may create omarchy/ or hypr/ under ~/.config
+
+
+def _config_default() -> str:
+    override = os.environ.get("WORKSPACE_SHIFT_CONFIG")
+    if override and os.path.isabs(override):
+        return override
+    return os.path.expanduser("~/.config/omarchy/workspace-shift.json")
+
+
+CONFIG_DEFAULT = _config_default()
 
 
 def _cloexec_nofollow(base: int) -> int:
@@ -40,22 +57,95 @@ def _cloexec_nofollow(base: int) -> int:
     return flags
 
 
-def _open_parent_dir(path: str) -> tuple[int, str]:
-    parent = os.path.dirname(os.path.abspath(path))
-    flags = _cloexec_nofollow(os.O_RDONLY | os.O_DIRECTORY)
+def _open_or_mkdir_component(dirfd: int, name: str, flags: int, may_create: bool, mode: int) -> int:
     try:
-        dirfd = os.open(parent, flags)
+        return os.open(name, flags, dir_fd=dirfd)
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise OSError(errno.ELOOP, f"parent directory is a symlink or not a dir: {parent}") from exc
+            raise OSError(errno.ELOOP, f"refusing symlink or non-directory path component: {name}") from exc
+        if exc.errno != errno.ENOENT or not may_create:
+            raise
+    try:
+        os.mkdir(name, mode, dir_fd=dirfd)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+    try:
+        return os.open(name, flags, dir_fd=dirfd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise OSError(errno.ELOOP, f"refusing symlink or non-directory path component: {name}") from exc
         raise
-    st = os.fstat(dirfd)
-    if not stat.S_ISDIR(st.st_mode):
-        os.close(dirfd)
-        raise OSError(errno.ENOTDIR, f"parent is not a directory: {parent}")
-    if st.st_uid != os.geteuid():
-        os.close(dirfd)
-        raise OSError(errno.EPERM, f"parent directory not owned by current user: {parent}")
+
+
+def open_dir_walk(path: str, *, create_tail: int = 0, mode: int = 0o700) -> int:
+    """Open a directory by walking from / with O_DIRECTORY|O_NOFOLLOW.
+
+    A pre-positioned symlink in any component cannot be followed. Only the last
+    `create_tail` components may be created, and only via mkdirat on the walk.
+    The leaf directory must be owned by euid.
+    """
+    path = os.path.abspath(path)
+    if not os.path.isabs(path):
+        raise OSError(errno.EINVAL, f"path must be absolute: {path}")
+    parts = [p for p in path.split(os.sep) if p]
+    if not parts:
+        raise OSError(errno.EINVAL, "refusing filesystem root")
+    flags = _cloexec_nofollow(os.O_RDONLY | os.O_DIRECTORY)
+    fd = os.open("/", flags)
+    n = len(parts)
+    try:
+        for i, part in enumerate(parts):
+            may_create = create_tail > 0 and (n - i) <= create_tail
+            next_fd = _open_or_mkdir_component(fd, part, flags, may_create, mode)
+            os.close(fd)
+            fd = next_fd
+        st = os.fstat(fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(errno.ENOTDIR, f"not a directory: {path}")
+        if st.st_uid != os.geteuid():
+            raise OSError(errno.EPERM, f"directory not owned by current user: {path}")
+        return fd
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def default_state_dir() -> str:
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg and os.path.isabs(xdg):
+        base = xdg
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "omarchy", "workspace-shift")
+
+
+def ensure_state_dir(path: str | None = None, *, create_tail: int = STATE_CREATE_TAIL, mode: int = 0o700) -> int:
+    """Open state dir with O_DIRECTORY|O_NOFOLLOW; refuse any symlink component."""
+    return open_dir_walk(path or default_state_dir(), create_tail=create_tail, mode=mode)
+
+
+def _parent_create_tail(parent: str) -> int:
+    parent = os.path.abspath(parent)
+    state = os.path.abspath(default_state_dir())
+    if parent == state or parent.startswith(state + os.sep):
+        return STATE_CREATE_TAIL
+    return PARENT_CREATE_TAIL
+
+
+def open_parent_dir(path: str, *, create: bool = False) -> tuple[int, str]:
+    """Descriptor-walk the parent of `path`. Create at most the last parent component."""
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+    if parent in ("", os.sep):
+        raise OSError(errno.EINVAL, f"refusing filesystem root as parent: {path}")
+    create_tail = _parent_create_tail(parent) if create else 0
+    dirfd = open_dir_walk(parent, create_tail=create_tail, mode=0o700)
     return dirfd, parent
 
 
@@ -88,78 +178,6 @@ def _open_lock(dirfd: int, name: str) -> int:
         os.close(lock_fd)
         raise
     return lock_fd
-
-
-LOCK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-STATE_CREATE_TAIL = 2  # only create omarchy/workspace-shift under the XDG state base
-
-
-def default_state_dir() -> str:
-    xdg = os.environ.get("XDG_STATE_HOME")
-    if xdg and os.path.isabs(xdg):
-        base = xdg
-    else:
-        base = os.path.join(os.path.expanduser("~"), ".local", "state")
-    return os.path.join(base, "omarchy", "workspace-shift")
-
-
-def _open_or_mkdir_component(dirfd: int, name: str, flags: int, may_create: bool, mode: int) -> int:
-    try:
-        return os.open(name, flags, dir_fd=dirfd)
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise OSError(errno.ELOOP, f"refusing symlink or non-directory path component: {name}") from exc
-        if exc.errno != errno.ENOENT or not may_create:
-            raise
-    try:
-        os.mkdir(name, mode, dir_fd=dirfd)
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        if exc.errno != errno.EEXIST:
-            raise
-    try:
-        return os.open(name, flags, dir_fd=dirfd)
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise OSError(errno.ELOOP, f"refusing symlink or non-directory path component: {name}") from exc
-        raise
-
-
-def ensure_state_dir(path: str | None = None, *, create_tail: int = STATE_CREATE_TAIL, mode: int = 0o700) -> int:
-    """Open state dir with O_DIRECTORY|O_NOFOLLOW; refuse any symlink component.
-
-    Walks from / so a pre-positioned symlink in the path cannot be followed.
-    Only the last `create_tail` components (omarchy/workspace-shift) may be created.
-    The leaf directory must be owned by euid.
-    """
-    path = os.path.abspath(path or default_state_dir())
-    if not os.path.isabs(path):
-        raise OSError(errno.EINVAL, f"state dir must be absolute: {path}")
-    parts = [p for p in path.split(os.sep) if p]
-    if not parts:
-        raise OSError(errno.EINVAL, "refusing filesystem root as state dir")
-    flags = _cloexec_nofollow(os.O_RDONLY | os.O_DIRECTORY)
-    fd = os.open("/", flags)
-    n = len(parts)
-    try:
-        for i, part in enumerate(parts):
-            may_create = (n - i) <= create_tail
-            next_fd = _open_or_mkdir_component(fd, part, flags, may_create, mode)
-            os.close(fd)
-            fd = next_fd
-        st = os.fstat(fd)
-        if not stat.S_ISDIR(st.st_mode):
-            raise OSError(errno.ENOTDIR, f"state path is not a directory: {path}")
-        if st.st_uid != os.geteuid():
-            raise OSError(errno.EPERM, f"state directory not owned by current user: {path}")
-        return fd
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        raise
 
 
 def _valid_lock_name(name: str) -> bool:
@@ -264,8 +282,162 @@ def _open_target(dirfd: int, name: str, path: str, *, write: bool) -> int | None
     return fd
 
 
+def _file_identity(st: os.stat_result, digest: bytes) -> tuple[int, int, int, int, bytes]:
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, digest)
+
+
+def _digest(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+
+def _open_temp(dirfd: int, name: str, mode: int) -> tuple[int, str]:
+    flags = _cloexec_nofollow(os.O_RDWR | os.O_CREAT | os.O_EXCL)
+    for _ in range(32):
+        tmp_name = f".{name}.{os.urandom(8).hex()}.tmp"
+        try:
+            fd = os.open(tmp_name, flags, mode, dir_fd=dirfd)
+            return fd, tmp_name
+        except FileExistsError:
+            continue
+    raise OSError(errno.EEXIST, "could not create unique temp file")
+
+
+def _write_fd(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    written = 0
+    while written < len(data):
+        n = os.write(fd, view[written:])
+        if n <= 0:
+            raise OSError(errno.EIO, "short write")
+        written += n
+    os.fsync(fd)
+
+
+def _recheck_identity(
+    dirfd: int,
+    name: str,
+    path: str,
+    expected: tuple[int, int, int, int, bytes] | None,
+) -> None:
+    fd = _open_target(dirfd, name, path, write=False)
+    try:
+        if expected is None:
+            if fd is not None:
+                raise OSError(errno.EEXIST, f"target appeared during write: {path}")
+            return
+        if fd is None:
+            raise OSError(errno.ENOENT, f"target disappeared during write: {path}")
+        st = os.fstat(fd)
+        raw = os.read(fd, expected[3] + 1)
+        now = _file_identity(st, _digest(raw))
+        if now != expected:
+            raise OSError(errno.ESTALE, f"target changed during write: {path}")
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _restore_after_replace(
+    dirfd: int,
+    name: str,
+    prev_data: bytes | None,
+    prev_mode: int,
+    existed: bool,
+) -> None:
+    """Best-effort restore of previous target after a failed post-replace fsync."""
+    if not existed:
+        try:
+            os.unlink(name, dir_fd=dirfd)
+            os.fsync(dirfd)
+        except OSError:
+            pass
+        return
+    if prev_data is None:
+        return
+    fd = None
+    tmp_name = ""
+    try:
+        fd, tmp_name = _open_temp(dirfd, name, prev_mode)
+        os.fchmod(fd, prev_mode)
+        _write_fd(fd, prev_data)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_name, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        tmp_name = ""
+        try:
+            os.fsync(dirfd)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    finally:
+        if fd is not None and fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_name:
+            try:
+                os.unlink(tmp_name, dir_fd=dirfd)
+            except OSError:
+                pass
+
+
+def _write_replace_locked(
+    dirfd: int,
+    name: str,
+    path: str,
+    data: bytes,
+    prev_mode: int,
+    *,
+    expected_id: tuple[int, int, int, int, bytes] | None,
+    prev_data: bytes | None,
+    existed: bool,
+) -> None:
+    fd, tmp_name = _open_temp(dirfd, name, prev_mode)
+    try:
+        tmp_st = os.fstat(fd)
+        if not stat.S_ISREG(tmp_st.st_mode):
+            raise OSError(errno.EPERM, "temp file is not regular")
+        os.fchmod(fd, prev_mode)
+        _write_fd(fd, data)
+        os.close(fd)
+        fd = -1
+        _recheck_identity(dirfd, name, path, expected_id)
+        os.replace(tmp_name, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        tmp_name = ""
+        try:
+            os.fsync(dirfd)
+        except OSError:
+            _restore_after_replace(dirfd, name, prev_data, prev_mode, existed)
+            raise
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_name:
+            try:
+                os.unlink(tmp_name, dir_fd=dirfd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def _read_capped(fd: int, path: str, max_bytes: int) -> bytes:
+    st = os.fstat(fd)
+    if st.st_size > max_bytes:
+        raise OSError(errno.EFBIG, f"file exceeds {max_bytes} bytes: {path}")
+    data = os.read(fd, max_bytes + 1)
+    if len(data) > max_bytes:
+        raise OSError(errno.EFBIG, f"file exceeds {max_bytes} bytes: {path}")
+    return data
+
+
 def read_bytes(path: str, max_bytes: int) -> bytes:
-    dirfd, _parent = _open_parent_dir(path)
+    dirfd, _parent = open_parent_dir(path, create=False)
     try:
         name = os.path.basename(path)
         lock_fd = _open_lock(dirfd, name)
@@ -274,13 +446,7 @@ def read_bytes(path: str, max_bytes: int) -> bytes:
             if fd is None:
                 return b""
             try:
-                st = os.fstat(fd)
-                if st.st_size > max_bytes:
-                    raise OSError(errno.EFBIG, f"file exceeds {max_bytes} bytes: {path}")
-                data = os.read(fd, max_bytes + 1)
-                if len(data) > max_bytes:
-                    raise OSError(errno.EFBIG, f"file exceeds {max_bytes} bytes: {path}")
-                return data
+                return _read_capped(fd, path, max_bytes)
             finally:
                 os.close(fd)
         finally:
@@ -293,57 +459,10 @@ def read_text(path: str, max_bytes: int) -> str:
     return read_bytes(path, max_bytes).decode("utf-8")
 
 
-def _write_replace_locked(
-    dirfd: int,
-    parent: str,
-    name: str,
-    path: str,
-    data: bytes,
-    prev_mode: int,
-) -> None:
-    fd, tmp_path = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=parent)
-    tmp_name = os.path.basename(tmp_path)
-    try:
-        tmp_st = os.fstat(fd)
-        if not stat.S_ISREG(tmp_st.st_mode):
-            raise OSError(errno.EPERM, "temp file is not regular")
-        parent_st = os.fstat(dirfd)
-        tmp_dir_st = os.stat(os.path.dirname(os.path.abspath(tmp_path)), follow_symlinks=False)
-        if (tmp_dir_st.st_dev, tmp_dir_st.st_ino) != (parent_st.st_dev, parent_st.st_ino):
-            raise OSError(errno.EPERM, "temp file is not in the target directory")
-        os.fchmod(fd, prev_mode)
-        view = memoryview(data)
-        written = 0
-        while written < len(data):
-            n = os.write(fd, view[written:])
-            if n <= 0:
-                raise OSError(errno.EIO, "short write")
-            written += n
-        os.fsync(fd)
-        os.close(fd)
-        fd = -1
-        os.replace(tmp_name, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
-        os.fsync(dirfd)
-        tmp_path = ""
-    finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
-
-
 def write_bytes(path: str, data: bytes, max_bytes: int | None = None, default_mode: int = DEFAULT_MODE) -> None:
     if max_bytes is not None and len(data) > max_bytes:
         raise OSError(errno.EFBIG, f"payload exceeds {max_bytes} bytes")
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    dirfd, parent = _open_parent_dir(path)
+    dirfd, _parent = open_parent_dir(path, create=True)
     try:
         name = os.path.basename(path)
         lock_fd = _open_lock(dirfd, name)
@@ -351,13 +470,30 @@ def write_bytes(path: str, data: bytes, max_bytes: int | None = None, default_mo
             exist_fd = _open_target(dirfd, name, path, write=True)
             try:
                 if exist_fd is not None:
-                    prev_mode = stat.S_IMODE(os.fstat(exist_fd).st_mode)
+                    cap = max_bytes if max_bytes is not None else os.fstat(exist_fd).st_size
+                    prev_data = _read_capped(exist_fd, path, cap)
+                    st = os.fstat(exist_fd)
+                    prev_mode = stat.S_IMODE(st.st_mode)
+                    expected_id = _file_identity(st, _digest(prev_data))
+                    existed = True
                 else:
+                    prev_data = None
                     prev_mode = default_mode
-                _write_replace_locked(dirfd, parent, name, path, data, prev_mode)
+                    expected_id = None
+                    existed = False
             finally:
                 if exist_fd is not None:
                     os.close(exist_fd)
+            _write_replace_locked(
+                dirfd,
+                name,
+                path,
+                data,
+                prev_mode,
+                expected_id=expected_id,
+                prev_data=prev_data,
+                existed=existed,
+            )
         finally:
             os.close(lock_fd)
     finally:
@@ -377,9 +513,7 @@ def rmw_text(
     missing_ok: bool = False,
     skip_if_missing: bool = False,
 ) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    dirfd, parent = _open_parent_dir(path)
+    dirfd, _parent = open_parent_dir(path, create=True)
     try:
         name = os.path.basename(path)
         lock_fd = _open_lock(dirfd, name)
@@ -391,17 +525,18 @@ def rmw_text(
                 if not missing_ok:
                     raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
                 original = ""
+                prev_data: bytes | None = None
                 prev_mode = default_mode
+                expected_id = None
+                existed = False
             else:
                 try:
+                    prev_data = _read_capped(exist_fd, path, max_bytes)
                     st = os.fstat(exist_fd)
-                    if st.st_size > max_bytes:
-                        raise OSError(errno.EFBIG, f"file exceeds {max_bytes} bytes: {path}")
-                    raw = os.read(exist_fd, max_bytes + 1)
-                    if len(raw) > max_bytes:
-                        raise OSError(errno.EFBIG, f"file exceeds {max_bytes} bytes: {path}")
-                    original = raw.decode("utf-8")
+                    original = prev_data.decode("utf-8")
                     prev_mode = stat.S_IMODE(st.st_mode)
+                    expected_id = _file_identity(st, _digest(prev_data))
+                    existed = True
                 finally:
                     os.close(exist_fd)
                     exist_fd = None
@@ -411,7 +546,16 @@ def rmw_text(
             payload = updated.encode("utf-8")
             if len(payload) > max_bytes:
                 raise OSError(errno.EFBIG, f"payload exceeds {max_bytes} bytes")
-            _write_replace_locked(dirfd, parent, name, path, payload, prev_mode)
+            _write_replace_locked(
+                dirfd,
+                name,
+                path,
+                payload,
+                prev_mode,
+                expected_id=expected_id,
+                prev_data=prev_data,
+                existed=existed,
+            )
         finally:
             os.close(lock_fd)
     finally:
@@ -559,12 +703,20 @@ def set_label_in_config(ws: str, text: str, path: str = CONFIG_DEFAULT) -> dict[
             labels[ident] = label
         else:
             labels.pop(ident, None)
-        # Re-apply cardinality after edit.
         data["labels"] = labels
         return dump_config(data)
 
     rmw_text(path, transform, max_bytes=CONFIG_MAX_BYTES, missing_ok=True)
     return load_config(path)
+
+
+def _exit_oserror(exc: OSError) -> int:
+    print(str(exc), file=sys.stderr)
+    if exc.errno == errno.EFBIG:
+        return 3
+    if exc.errno == errno.ESTALE:
+        return 4
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -613,7 +765,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.cmd == "hold-lock":
             return hold_lock(args.state_dir, args.name, args.timeout)
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        return _exit_oserror(exc)
+    except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     return 2

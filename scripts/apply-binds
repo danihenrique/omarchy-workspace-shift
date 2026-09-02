@@ -16,25 +16,38 @@ PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHIFT = os.path.join(PLUGIN_DIR, "scripts", "workspace-shift")
 BEGIN = f"-- BEGIN {PLUGIN_ID}"
 END = f"-- END {PLUGIN_ID}"
-BINDINGS = os.path.expanduser("~/.config/hypr/bindings.lua")
-CONFIG = safe_io.CONFIG_DEFAULT
 DEFAULT_LEFT = safe_io.DEFAULT_LEFT
 DEFAULT_RIGHT = safe_io.DEFAULT_RIGHT
 EXTRA_LEFT = "SUPER + less"
 EXTRA_RIGHT = "SUPER + greater"
-OLD_SCRIPT = "omarchy-workspace-shift"
 BINDINGS_MAX = safe_io.BINDINGS_MAX_BYTES
+SCREENS_BEGIN = "-- BEGIN im0001gt.screens"
+INTERIOR_RE = re.compile(
+    r'^(?:hl\.unbind\("(?:[^"\\]|\\.)*"\)'
+    r'|o\.bind\("(?:[^"\\]|\\.)*", "(?:[^"\\]|\\.)*", "(?:[^"\\]|\\.)*"\))$'
+)
+
+
+def bindings_path() -> str:
+    override = os.environ.get("WORKSPACE_SHIFT_BINDINGS")
+    if override and os.path.isabs(override):
+        return override
+    return os.path.expanduser("~/.config/hypr/bindings.lua")
+
+
+def config_path() -> str:
+    return safe_io.CONFIG_DEFAULT
 
 
 def load_config() -> dict:
     try:
-        return safe_io.load_config(CONFIG)
+        return safe_io.load_config(config_path())
     except OSError:
         return safe_io.sanitize_config({})
 
 
 def save_config(data: dict) -> None:
-    safe_io.save_config(data, CONFIG)
+    safe_io.save_config(data, config_path())
 
 
 def lua_escape(value: str) -> str:
@@ -73,52 +86,121 @@ def managed_block(left: str, right: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def strip_managed(text: str) -> str:
-    return re.sub(
-        r"\n*" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n*",
-        "\n",
-        text,
-        flags=re.S,
-    )
+def split_managed(text: str) -> tuple[str, str | None, str]:
+    """Split out a unique, structurally validated managed block. Fail closed otherwise."""
+    lines = text.splitlines(keepends=True)
+    begins: list[int] = []
+    ends: list[int] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == BEGIN:
+            begins.append(i)
+        elif stripped == END:
+            ends.append(i)
+    if not begins and not ends:
+        return text, None, ""
+    if len(begins) != 1 or len(ends) != 1:
+        raise ValueError("managed bind block is not unique")
+    begin_at, end_at = begins[0], ends[0]
+    if end_at <= begin_at:
+        raise ValueError("managed bind block is malformed")
+    for line in lines[begin_at + 1 : end_at]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped in (BEGIN, END) or not INTERIOR_RE.fullmatch(stripped):
+            raise ValueError("managed bind block contains unexpected content")
+    before = "".join(lines[:begin_at])
+    block = "".join(lines[begin_at : end_at + 1])
+    after = "".join(lines[end_at + 1 :])
+    return before, block, after
 
 
-def strip_old_adhoc(text: str) -> str:
-    text = re.sub(
-        r"\n*-- Shift whole workspace left/right\..*?(?=\n-- BEGIN |\Z)",
-        "\n",
-        text,
-        flags=re.S,
-    )
+def strip_legacy_exact(text: str) -> str:
+    """Delete only lines that contain this plugin's absolute script path."""
     kept: list[str] = []
     for line in text.splitlines(True):
-        if OLD_SCRIPT in line:
-            continue
-        if SHIFT in line and "o.bind(" in line:
+        if SHIFT in line:
             continue
         kept.append(line)
-    text = "".join(kept)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.rstrip() + "\n"
+    out = "".join(kept)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    if not out.endswith("\n"):
+        out += "\n"
+    return out
 
 
-def write_bindings(block: str, remove_only: bool) -> None:
+def compose_bindings(text: str, block: str, remove_only: bool, migrate_legacy: bool) -> str:
+    before, existing, after = split_managed(text)
+    if migrate_legacy:
+        before = strip_legacy_exact(before)
+        after = strip_legacy_exact(after)
+    if remove_only:
+        combined = before.rstrip("\n")
+        rest = after.lstrip("\n")
+        if combined and rest:
+            text = combined + "\n\n" + rest
+        else:
+            text = combined + rest
+        if text and not text.endswith("\n"):
+            text += "\n"
+        return text or "\n"
+    insertion = block if block.endswith("\n") else block + "\n"
+    if existing is not None:
+        glue = "" if after.startswith("\n") or not after else "\n"
+        text = before + insertion + glue + after
+        if not text.endswith("\n"):
+            text += "\n"
+        return text
+    body = before + after
+    if SCREENS_BEGIN in body:
+        text = body.replace(SCREENS_BEGIN, insertion + "\n" + SCREENS_BEGIN, 1)
+    else:
+        text = body.rstrip() + "\n\n" + insertion
+    if not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def write_bindings(block: str, remove_only: bool, migrate_legacy: bool) -> None:
     def transform(text: str) -> str:
-        text = strip_managed(text)
-        text = strip_old_adhoc(text)
-        if not remove_only:
-            screens = "-- BEGIN im0001gt.screens"
-            insertion = block if block.endswith("\n") else block + "\n"
-            if screens in text:
-                text = text.replace(screens, insertion + "\n" + screens, 1)
-            else:
-                text = text.rstrip() + "\n\n" + insertion
-        return text if text.endswith("\n") else text + "\n"
+        return compose_bindings(text, block, remove_only, migrate_legacy)
 
-    safe_io.rmw_text(BINDINGS, transform, max_bytes=BINDINGS_MAX, missing_ok=False)
+    safe_io.rmw_text(bindings_path(), transform, max_bytes=BINDINGS_MAX, missing_ok=False)
+
+
+def apply_config_then_bindings(cfg: dict, block: str, remove_only: bool, migrate_legacy: bool) -> None:
+    """Write config first, then bindings; restore config if the bindings write fails."""
+    prev_cfg: bytes | None = None
+    cfg_written = False
+    if not remove_only:
+        try:
+            prev_cfg = safe_io.read_bytes(config_path(), safe_io.CONFIG_MAX_BYTES)
+        except OSError:
+            prev_cfg = b""
+        save_config(cfg)
+        cfg_written = True
+    try:
+        write_bindings(block, remove_only, migrate_legacy)
+    except Exception:
+        if cfg_written:
+            try:
+                safe_io.write_bytes(
+                    config_path(),
+                    prev_cfg or b"",
+                    max_bytes=safe_io.CONFIG_MAX_BYTES,
+                )
+            except OSError:
+                pass
+        raise
 
 
 def run_timeout(args: list[str], seconds: int = 5) -> subprocess.CompletedProcess:
-    cmd = ["timeout", "--kill-after=2s", f"{seconds}s", *args]
+    wrap = os.path.join(PLUGIN_DIR, "scripts", "with-timeout")
+    if os.path.isfile(wrap) and os.access(wrap, os.X_OK):
+        cmd = [wrap, str(seconds), *args]
+    else:
+        cmd = ["timeout", "--kill-after=2s", f"{seconds}s", *args]
     return subprocess.run(cmd, check=False)
 
 
@@ -133,6 +215,11 @@ def main() -> int:
     parser.add_argument("--right", help="Omarchy bind syntax for shift right")
     parser.add_argument("--no-reload", action="store_true")
     parser.add_argument(
+        "--migrate-legacy",
+        action="store_true",
+        help="Also delete lines outside the managed block that contain this plugin's absolute script path",
+    )
+    parser.add_argument(
         "--set-label",
         nargs=2,
         metavar=("ID", "TEXT"),
@@ -143,11 +230,11 @@ def main() -> int:
     try:
         if args.set_label is not None:
             ws, text = args.set_label
-            safe_io.set_label_in_config(ws, text, CONFIG)
+            safe_io.set_label_in_config(ws, text, config_path())
             return 0
 
         if args.remove:
-            write_bindings("", remove_only=True)
+            apply_config_then_bindings({}, "", remove_only=True, migrate_legacy=args.migrate_legacy)
             if not args.no_reload:
                 reload()
             return 0
@@ -165,8 +252,12 @@ def main() -> int:
         cfg["shortcutRight"] = right
         if not isinstance(cfg.get("labels"), dict):
             cfg["labels"] = {}
-        save_config(cfg)
-        write_bindings(managed_block(left, right), remove_only=False)
+        apply_config_then_bindings(
+            cfg,
+            managed_block(left, right),
+            remove_only=False,
+            migrate_legacy=args.migrate_legacy,
+        )
         if not args.no_reload:
             reload()
         return 0

@@ -3,15 +3,16 @@
 # Hyprland cannot reorder workspace numbers, so "shift" means exchanging
 # window sets via an empty temp workspace.
 #
-# Moves are locked, snapshotted, and rolled back on failure — including if
-# label persist fails after windows have already moved. Omarchy: focus each
-# window before moving (address-only moves are flaky).
+# Moves are locked, snapshotted, audited, and rolled back on failure —
+# including if label persist fails after windows have already moved.
+# Omarchy: focus each window before moving (address-only moves are flaky).
 #
 # Temp workspace: under swap.lock, pick an empty id (prefer 8,9,10,7,6,3,
 # then unused 11–99 which Hyprland creates on demand, then remaining 1–5),
 # and re-verify it is still empty immediately before the first move. If it
-# gained windows, pick another or abort. A millisecond compositor TOCTOU
-# between verify and dispatch remains; a failed move rolls the snapshot back.
+# gained windows, pick another or abort. After every move phase and before
+# labels, re-snapshot and fail closed on drift (then roll windows back and
+# do not swap labels).
 set -uo pipefail
 
 usage() {
@@ -23,34 +24,42 @@ usage() {
 NOTIFY_GLYPH=$'\U000f08ac'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SAFE_IO="${SCRIPT_DIR}/safe_io.py"
+WITH_TIMEOUT="${SCRIPT_DIR}/with-timeout"
 HYPR_MAX_BYTES=2097152
 HYPR_TIMEOUT=5
 MAX_CLIENTS=256
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-shift"
+CONFIG_PATH="${HOME}/.config/omarchy/workspace-shift.json"
 _WS_LOCK_HELD=0
 
 notify() {
   local msg="$1"
   local timeout="${2:-1500}"
-  timeout --kill-after=2s 5s omarchy-notification-send -g "$NOTIFY_GLYPH" "$msg" -t "$timeout" >/dev/null 2>&1 || true
+  "$WITH_TIMEOUT" 5 omarchy-notification-send -g "$NOTIFY_GLYPH" "$msg" -t "$timeout" >/dev/null 2>&1 || true
 }
 
+# systemd-run --user --pipe + RuntimeMaxSec + SIGKILL, producer-side head -c.
 hypr_json() {
-  timeout --kill-after=2s "${HYPR_TIMEOUT}s" hyprctl "$@" | head -c "${HYPR_MAX_BYTES}"
+  "$WITH_TIMEOUT" "$HYPR_TIMEOUT" \
+    sh -c 'hyprctl "$@" | head -c '"${HYPR_MAX_BYTES}" sh "$@"
 }
 
 hypr_dispatch() {
-  timeout --kill-after=2s "${HYPR_TIMEOUT}s" hyprctl dispatch "$@"
+  "$WITH_TIMEOUT" "$HYPR_TIMEOUT" hyprctl dispatch "$@"
+}
+
+jq_run() {
+  "$WITH_TIMEOUT" "$HYPR_TIMEOUT" jq "$@"
 }
 
 emit_status() {
   # emit_status OK ERROR SRC DEST ROLLED
   local ok="$1" error="$2" src="$3" dest="$4" rolled="${5:-}"
   if [[ -n "$rolled" ]]; then
-    jq -nc --argjson ok "$ok" --arg error "$error" --argjson src "$src" --argjson dest "$dest" --argjson rolled_back "$rolled" \
+    jq_run -nc --argjson ok "$ok" --arg error "$error" --argjson src "$src" --argjson dest "$dest" --argjson rolled_back "$rolled" \
       '{ok:$ok,src:$src,dest:$dest} + (if $error != "" then {error:$error} else {} end) + {rolled_back:$rolled_back}'
   else
-    jq -nc --argjson ok "$ok" --arg error "$error" --argjson src "$src" --argjson dest "$dest" \
+    jq_run -nc --argjson ok "$ok" --arg error "$error" --argjson src "$src" --argjson dest "$dest" \
       '{ok:$ok,src:$src,dest:$dest} + (if $error != "" then {error:$error} else {} end)'
   fi
 }
@@ -73,7 +82,7 @@ clients_within_cap() {
   if (( ${#raw} < 2 || ${#raw} >= HYPR_MAX_BYTES )); then
     return 1
   fi
-  n="$(timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq 'if type=="array" then length else empty end' <<<"$raw")" || return 1
+  n="$(jq_run 'if type=="array" then length else empty end' <<<"$raw")" || return 1
   if [[ -z "$n" || ! "$n" =~ ^[0-9]+$ ]]; then
     return 1
   fi
@@ -97,7 +106,7 @@ load_clients_json() {
 
 snapshot_clients_from_raw() {
   local raw="$1" src="$2" dest="$3"
-  timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -c --argjson src "$src" --argjson dest "$dest" '
+  jq_run -c --argjson src "$src" --argjson dest "$dest" '
     [
       .[]?
       | select(.mapped == true and ((.pinned // false) | not))
@@ -110,9 +119,47 @@ snapshot_clients_from_raw() {
 
 clients_from_snap() {
   local snap="$1" ws="$2"
-  timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r --argjson ws "$ws" '
+  jq_run -r --argjson ws "$ws" '
     .[] | select(.workspace == $ws) | .address
   ' <<<"$snap"
+}
+
+# expected_json maps address -> workspace id that each snapshotted client should occupy.
+expected_from_snap() {
+  local snap="$1" src="$2" dest="$3" src_to="$4" dest_to="$5"
+  jq_run -c --argjson src "$src" --argjson dest "$dest" --argjson src_to "$src_to" --argjson dest_to "$dest_to" '
+    reduce .[] as $c ({};
+      if $c.workspace == $src then .[$c.address] = $src_to
+      elif $c.workspace == $dest then .[$c.address] = $dest_to
+      else . end)
+  ' <<<"$snap"
+}
+
+# Fail closed unless: every snapshotted address is on its expected workspace,
+# and src/dest/temp hold no unexpected mapped non-pinned clients.
+audit_clients() {
+  local raw="$1"
+  local expected="$2"
+  local src="$3"
+  local dest="$4"
+  local temp="${5:-0}"
+  jq_run -e --argjson expected "$expected" --argjson src "$src" --argjson dest "$dest" --argjson temp "$temp" '
+    def mapped:
+      [.[]?
+       | select(.mapped == true and ((.pinned // false) | not))
+       | select((.address | type) == "string" and (.address | test("^0x[0-9a-fA-F]+$")))];
+    def rooms:
+      if $temp == 0 then [$src, $dest] else [$src, $dest, $temp] end;
+    (mapped) as $m
+    | ([$expected | keys[]] | all(
+        . as $a
+        | ($m | map(select(.address == $a)) | length == 1)
+          and (($m | map(select(.address == $a))[0].workspace.id) == $expected[$a])
+      ))
+    and ($m
+         | map(select(.workspace.id as $w | rooms | index($w) != null))
+         | all($expected[.address] != null))
+  ' <<<"$raw" >/dev/null
 }
 
 focus_workspace() {
@@ -132,7 +179,7 @@ move_addr() {
   [[ "$out" == "ok" ]] || return 1
   sleep 0.03
   raw="$(hypr_json clients -j)" || return 1
-  now="$(timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r --arg a "$addr" '
+  now="$(jq_run -r --arg a "$addr" '
     .[] | select(.address == $a) | .workspace.id | tostring
   ' <<<"$raw")" || return 1
   [[ "$now" == "$dest" ]]
@@ -146,13 +193,13 @@ rollback_snapshot() {
     valid_addr "$addr" || continue
     valid_ws "$ws" || continue
     move_addr "$addr" "$ws" || fail=1
-  done < <(timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r '.[] | [.address, (.workspace|tostring)] | @tsv' <<<"$snap")
+  done < <(jq_run -r '.[] | [.address, (.workspace|tostring)] | @tsv' <<<"$snap")
   return "$fail"
 }
 
 workspace_client_count() {
   local ws="$1" raw="$2"
-  timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq --argjson ws "$ws" '
+  jq_run --argjson ws "$ws" '
     [.[] | select(.workspace.id == $ws)] | length
   ' <<<"$raw"
 }
@@ -200,7 +247,6 @@ claim_temp() {
     if [[ -z "$candidate" ]]; then
       return 1
     fi
-    # Re-verify under swap.lock immediately before the caller uses TEMP.
     if temp_is_empty "$candidate"; then
       echo "$candidate"
       return 0
@@ -245,6 +291,47 @@ fail_swap() {
   return 1
 }
 
+abort_with_rollback() {
+  local code="$1" src="$2" dest="$3" focus_after="$4" snap="$5"
+  local rolled=true
+  if ! rollback_snapshot "$snap"; then
+    rolled=false
+  fi
+  notify "Workspace shift failed" 2000
+  focus_workspace "$focus_after"
+  emit_status false "$code" "$src" "$dest" "$rolled"
+  return 1
+}
+
+restore_labels() {
+  local prev="$1"
+  if [[ -z "$prev" ]]; then
+    return 0
+  fi
+  printf '%s' "$prev" | "$WITH_TIMEOUT" 5 python3 "$SAFE_IO" write --max-bytes 65536 "$CONFIG_PATH" >/dev/null 2>&1 || true
+}
+
+move_group() {
+  local dest="$1"
+  shift
+  local addr
+  for addr in "$@"; do
+    [[ -n "${addr:-}" ]] || continue
+    move_addr "$addr" "$dest" || return 1
+  done
+  return 0
+}
+
+audit_or_fail() {
+  local raw expected src dest temp
+  expected="$1"
+  src="$2"
+  dest="$3"
+  temp="${4:-0}"
+  raw="$(load_clients_json)" || return 1
+  audit_clients "$raw" "$expected" "$src" "$dest" "$temp"
+}
+
 swap_workspaces() {
   local src="$1"
   local dest="$2"
@@ -284,11 +371,17 @@ swap_workspaces() {
   mapfile -t SRC_ADDRS < <(clients_from_snap "$snap" "$src")
   mapfile -t DEST_ADDRS < <(clients_from_snap "$snap" "$dest")
 
-  local fail=0 addr TEMP=""
+  local TEMP=0
   local need_temp=0
   if (( ${#SRC_ADDRS[@]} > 0 && ${#DEST_ADDRS[@]} > 0 )); then
     need_temp=1
   fi
+
+  local exp_final exp_mid
+  exp_final="$(expected_from_snap "$snap" "$src" "$dest" "$dest" "$src")" || {
+    fail_swap "snapshot-failed" "$src" "$dest" "$focus_after"
+    return 1
+  }
 
   if (( need_temp )); then
     TEMP="$(claim_temp "$src" "$dest" || true)"
@@ -304,47 +397,65 @@ swap_workspaces() {
       emit_status false "no-temp" "$src" "$dest"
       return 1
     fi
-    for addr in "${SRC_ADDRS[@]}"; do
-      [[ -n "${addr:-}" ]] || continue
-      move_addr "$addr" "$TEMP" || fail=1
-    done
-    if (( fail == 0 )); then
-      for addr in "${DEST_ADDRS[@]}"; do
-        [[ -n "${addr:-}" ]] || continue
-        move_addr "$addr" "$src" || fail=1
-      done
+    if ! move_group "$TEMP" "${SRC_ADDRS[@]}"; then
+      abort_with_rollback "move-failed" "$src" "$dest" "$focus_after" "$snap"
+      return 1
     fi
-    if (( fail == 0 )); then
-      for addr in "${SRC_ADDRS[@]}"; do
-        [[ -n "${addr:-}" ]] || continue
-        move_addr "$addr" "$dest" || fail=1
-      done
+    exp_mid="$(expected_from_snap "$snap" "$src" "$dest" "$TEMP" "$dest")" || {
+      abort_with_rollback "audit-failed" "$src" "$dest" "$focus_after" "$snap"
+      return 1
+    }
+    if ! audit_or_fail "$exp_mid" "$src" "$dest" "$TEMP"; then
+      abort_with_rollback "audit-failed" "$src" "$dest" "$focus_after" "$snap"
+      return 1
+    fi
+    if ! move_group "$src" "${DEST_ADDRS[@]}"; then
+      abort_with_rollback "move-failed" "$src" "$dest" "$focus_after" "$snap"
+      return 1
+    fi
+    exp_mid="$(expected_from_snap "$snap" "$src" "$dest" "$TEMP" "$src")" || {
+      abort_with_rollback "audit-failed" "$src" "$dest" "$focus_after" "$snap"
+      return 1
+    }
+    if ! audit_or_fail "$exp_mid" "$src" "$dest" "$TEMP"; then
+      abort_with_rollback "audit-failed" "$src" "$dest" "$focus_after" "$snap"
+      return 1
+    fi
+    if ! move_group "$dest" "${SRC_ADDRS[@]}"; then
+      abort_with_rollback "move-failed" "$src" "$dest" "$focus_after" "$snap"
+      return 1
     fi
   else
-    for addr in "${SRC_ADDRS[@]}"; do
-      [[ -n "${addr:-}" ]] || continue
-      move_addr "$addr" "$dest" || fail=1
-    done
-    if (( fail == 0 )); then
-      for addr in "${DEST_ADDRS[@]}"; do
-        [[ -n "${addr:-}" ]] || continue
-        move_addr "$addr" "$src" || fail=1
-      done
+    if ! move_group "$dest" "${SRC_ADDRS[@]}"; then
+      abort_with_rollback "move-failed" "$src" "$dest" "$focus_after" "$snap"
+      return 1
+    fi
+    if (( ${#DEST_ADDRS[@]} > 0 )); then
+      exp_mid="$(expected_from_snap "$snap" "$src" "$dest" "$dest" "$dest")" || {
+        abort_with_rollback "audit-failed" "$src" "$dest" "$focus_after" "$snap"
+        return 1
+      }
+      if ! audit_or_fail "$exp_mid" "$src" "$dest" 0; then
+        abort_with_rollback "audit-failed" "$src" "$dest" "$focus_after" "$snap"
+        return 1
+      fi
+      if ! move_group "$src" "${DEST_ADDRS[@]}"; then
+        abort_with_rollback "move-failed" "$src" "$dest" "$focus_after" "$snap"
+        return 1
+      fi
     fi
   fi
 
-  if (( fail )); then
-    local rolled=true
-    if ! rollback_snapshot "$snap"; then
-      rolled=false
-    fi
-    notify "Workspace shift failed" 2000
-    focus_workspace "$focus_after"
-    emit_status false "move-failed" "$src" "$dest" "$rolled"
+  if ! audit_or_fail "$exp_final" "$src" "$dest" "${TEMP:-0}"; then
+    abort_with_rollback "audit-failed" "$src" "$dest" "$focus_after" "$snap"
     return 1
   fi
 
-  if ! timeout --kill-after=2s 5s python3 "$SAFE_IO" swap-labels "$src" "$dest"; then
+  local prev_labels=""
+  prev_labels="$("$WITH_TIMEOUT" 5 python3 "$SAFE_IO" read --max-bytes 65536 "$CONFIG_PATH" 2>/dev/null || true)"
+
+  if ! "$WITH_TIMEOUT" 5 python3 "$SAFE_IO" swap-labels "$src" "$dest" --config "$CONFIG_PATH"; then
+    restore_labels "$prev_labels"
     local rolled=true
     if ! rollback_snapshot "$snap"; then
       rolled=false
@@ -363,7 +474,7 @@ swap_workspaces() {
 CMD="${1:-}"
 case "$CMD" in
   left|right)
-    CURRENT="$(hypr_json activeworkspace -j | timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r '.id')"
+    CURRENT="$(hypr_json activeworkspace -j | jq_run -r '.id')"
     valid_ws "${CURRENT:-}" || exit 1
     if [[ "$CMD" == "left" ]]; then
       NEIGHBOR=$((CURRENT - 1))
@@ -391,7 +502,7 @@ case "$CMD" in
       exit 1
     fi
     mapfile -t CURRENT_ADDRS < <(
-      timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r --argjson ws "$CURRENT" '
+      jq_run -r --argjson ws "$CURRENT" '
         .[]
         | select(.workspace.id == $ws and .mapped == true and ((.pinned // false) | not))
         | select((.address | type) == "string" and (.address | test("^0x[0-9a-fA-F]+$")))
@@ -410,7 +521,7 @@ case "$CMD" in
     SRC="${2:-}"
     DEST="${3:-}"
     [[ -n "$SRC" && -n "$DEST" ]] || usage
-    ORIG="$(hypr_json activeworkspace -j | timeout --kill-after=2s "${HYPR_TIMEOUT}s" jq -r '.id' || true)"
+    ORIG="$(hypr_json activeworkspace -j | jq_run -r '.id' || true)"
     valid_ws "${ORIG:-}" || ORIG="$DEST"
     swap_workspaces "$SRC" "$DEST" "$ORIG" || exit $?
     ;;

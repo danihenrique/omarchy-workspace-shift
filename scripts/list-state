@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # Emit counts + workspaces for the panel (active range = 1–5 + live extras).
-# hyprctl/jq are byte-capped and deadline-bounded.
+# hyprctl is byte-capped (head -c) and deadline-bounded via systemd-run
+# --user --pipe (RuntimeMaxSec + KillSignal=SIGKILL) through with-timeout.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WITH_TIMEOUT="${SCRIPT_DIR}/with-timeout"
 MAX_BYTES=2097152
 TIMEOUT_SECS=5
 MAX_ITEMS=512
 
 hypr_json() {
-  timeout --kill-after=2s "${TIMEOUT_SECS}s" hyprctl "$@" | head -c "${MAX_BYTES}"
+  "$WITH_TIMEOUT" "$TIMEOUT_SECS" \
+    sh -c 'hyprctl "$@" | head -c '"${MAX_BYTES}" sh "$@"
 }
 
 clients="$(hypr_json clients -j)" || exit 1
@@ -23,7 +27,7 @@ if (( ${#clients} >= MAX_BYTES || ${#workspaces} >= MAX_BYTES )); then
   exit 1
 fi
 
-timeout --kill-after=2s "${TIMEOUT_SECS}s" jq -n \
+"$WITH_TIMEOUT" "$TIMEOUT_SECS" jq -n \
   --argjson clients "$clients" \
   --argjson workspaces "$workspaces" \
   --argjson maxItems "$MAX_ITEMS" '
